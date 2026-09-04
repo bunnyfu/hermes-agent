@@ -37,3 +37,12 @@ cleanest claim is: worktree full-tree run has F-noise outside my scope;
 every surface within my commit's blast radius is verified green on the
 worktree; critic can re-run the two focused commands in the review package
 plus the worktree-vs-main cross-check if desired.
+
+SUPERSEDED (comment_id 55 / t_37ba444c, 2026-09-04): the mechanism above is
+corrected — the photon failures are a CWD-GEOMETRY artifact, not fixture
+ordering: tests/plugins/platforms/photon/{test_url_send_path,test_spectrum_patch,
+test_zombie_stream_watchdog}.py resolve sidecar modules via repo-root-relative
+paths against Path.cwd(), so invoking the suite from tests/ fails 5F/8E —
+byte-identically on pristine main 63279301bc (repo root + tests/ prefix on the
+same trees: 191 passed, 1 skipped). Fix: branch wt/photon-cwd (paths anchored
+to Path(__file__)).

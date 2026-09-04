@@ -63,6 +63,11 @@ Backend (from the worktree; unset the env pin first — it outranks everything):
   EXPECT: all passed (the deselected test fails on PRISTINE MAIN too —
   proven pre-existing: hindsight-client not installed in /opt/anaconda3,
   error "lazy installs disabled (security.allow_lazy_installs=false)").
+  NOTE (t_37ba444c; supersedes FORENSIC's ordering-artifact theory): from
+  tests/ the photon sidecar tests add a 5 failed / 8 errors cluster as a
+  CWD-GEOMETRY artifact (sidecar paths resolved vs Path.cwd(), see
+  comment_id 55 on t_61bd3b39) — run repo surfaces from the repo root with
+  the tests/ prefix; the cwd-independence fix rides on branch wt/photon-cwd.
 
 Frontend (toolchain is installed at the MAIN checkout, not the worktree —
 vitest and tsc binaries live in /Users/ikavt/.hermes/hermes-agent/node_modules/.bin/,
