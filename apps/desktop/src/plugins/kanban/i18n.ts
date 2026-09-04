@@ -49,6 +49,7 @@ type KanbanMessages = {
   allProfiles: string
   allTenants: string
   showArchived: string
+  chipArchived: string
   groupRunning: string
   nSelected: (n: number) => string
   moveToShort: string
@@ -262,6 +263,7 @@ export const en: KanbanMessages = {
   allProfiles: 'All profiles',
   allTenants: 'All tenants',
   showArchived: 'Show archived',
+  chipArchived: 'archived',
   groupRunning: 'Group Running by profile',
   nSelected: n => `${n} selected`,
   moveToShort: 'Move to',
@@ -474,6 +476,7 @@ const ja: KanbanMessages = {
   allProfiles: 'すべてのプロフィール',
   allTenants: 'すべてのテナント',
   showArchived: 'アーカイブを表示',
+  chipArchived: 'アーカイブ済み',
   groupRunning: '実行中をプロフィールでグループ化',
   nSelected: n => `${n} 件選択中`,
   moveToShort: '移動',
@@ -684,6 +687,7 @@ const zh: KanbanMessages = {
   allProfiles: '所有配置档',
   allTenants: '所有租户',
   showArchived: '显示已归档',
+  chipArchived: '已归档',
   groupRunning: '按配置档分组运行中',
   nSelected: n => `已选择 ${n} 个`,
   moveToShort: '移动到',
@@ -892,6 +896,7 @@ const zhHant: KanbanMessages = {
   allProfiles: '所有設定檔',
   allTenants: '所有租戶',
   showArchived: '顯示已封存',
+  chipArchived: '已封存',
   groupRunning: '依設定檔分組執行中',
   nSelected: n => `已選取 ${n} 個`,
   moveToShort: '移至',

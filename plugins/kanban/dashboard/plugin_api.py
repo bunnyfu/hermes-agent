@@ -456,6 +456,17 @@ def get_board(
         if include_archived:
             columns["archived"] = []
 
+        # Archived count, reported even when the archived lane is filtered
+        # out: a fully drained board must not be indistinguishable from a
+        # wiped one, so the header can render an "N archived" chip while the
+        # default view stays quiet. Mirrors list_tasks' tenant filter; the
+        # status predicate is the same one that filter hides on.
+        archived_count = conn.execute(
+            "SELECT COUNT(*) AS n FROM tasks WHERE status = 'archived'"
+            + (" AND tenant = ?" if tenant is not None else ""),
+            [tenant] if tenant is not None else [],
+        ).fetchone()["n"]
+
         # Batch-fetch the latest non-null run summary per task in one
         # window-function query (avoids N+1 ``latest_summary`` calls
         # for boards with hundreds of tasks). Truncated to a card-size
@@ -506,6 +517,7 @@ def get_board(
             ],
             "tenants": tenants,
             "assignees": assignees,
+            "archived_count": int(archived_count),
             "latest_event_id": int(latest_event_id),
             "now": int(time.time()),
         }

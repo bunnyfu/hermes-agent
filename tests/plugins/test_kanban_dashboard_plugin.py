@@ -1230,3 +1230,68 @@ def test_specify_happy_path(client, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Archived count on GET /board (drained-board visibility fix)
+# ---------------------------------------------------------------------------
+
+
+def test_board_archived_count_hidden_by_default(client):
+    """archived_count is in the payload even when the archived lane is not."""
+    client.post("/api/plugins/kanban/tasks", json={"title": "live"})
+
+    board = client.get("/api/plugins/kanban/board").json()
+    names = [c["name"] for c in board["columns"]]
+    assert "archived" not in names
+    assert board["archived_count"] == 0
+
+
+def test_board_archived_count_counts_archived_without_lane(client):
+    """Archive two tasks; the default view hides them but reports count=2."""
+    ids = []
+    for title in ("gone-a", "gone-b", "stays"):
+        task = client.post("/api/plugins/kanban/tasks", json={"title": title}).json()["task"]
+        ids.append(task["id"])
+
+    r = client.post(
+        "/api/plugins/kanban/tasks/bulk",
+        json={"ids": ids[:2], "archive": True},
+    )
+    assert r.status_code == 200
+    assert all(res["ok"] for res in r.json()["results"])
+
+    board = client.get("/api/plugins/kanban/board").json()
+    visible = {t["id"] for col in board["columns"] for t in col["tasks"]}
+    assert ids[0] not in visible and ids[1] not in visible
+    assert ids[2] in visible
+    assert "archived" not in [c["name"] for c in board["columns"]]
+    assert board["archived_count"] == 2
+
+    # Flagged request: archived lane appears AND the count still matches it.
+    flagged = client.get("/api/plugins/kanban/board?include_archived=true").json()
+    archived_col = next(c for c in flagged["columns"] if c["name"] == "archived")
+    assert len(archived_col["tasks"]) == 2
+    assert flagged["archived_count"] == 2
+
+
+def test_board_archived_count_respects_tenant_filter(client):
+    """Tenant-scoped reads count only that tenant's archived rows."""
+    a = client.post(
+        "/api/plugins/kanban/tasks", json={"title": "ta", "tenant": "t-one"}
+    ).json()["task"]
+    b = client.post(
+        "/api/plugins/kanban/tasks", json={"title": "tb", "tenant": "t-two"}
+    ).json()["task"]
+    r = client.post(
+        "/api/plugins/kanban/tasks/bulk",
+        json={"ids": [a["id"], b["id"]], "archive": True},
+    )
+    assert r.status_code == 200
+
+    scoped = client.get(
+        "/api/plugins/kanban/board", params={"tenant": "t-one"}
+    ).json()
+    assert scoped["archived_count"] == 1
+
+    unscoped = client.get("/api/plugins/kanban/board").json()
+    assert unscoped["archived_count"] == 2
+

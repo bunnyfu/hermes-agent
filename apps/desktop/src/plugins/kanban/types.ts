@@ -34,6 +34,9 @@ export interface KanbanBoard {
   columns: KanbanColumn[]
   tenants: string[]
   assignees: string[]
+  /** Rows in the archived lane, reported even while that lane is filtered
+   *  out — the header chip needs the number when the column isn't shown. */
+  archived_count: number
   latest_event_id: number
   now: number
 }

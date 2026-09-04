@@ -65,6 +65,7 @@ import {
   $collapsedLanes,
   $introDismissed,
   $lanesByProfile,
+  $showArchived,
   boardKey,
   BOARDS_KEY,
   bulkTasks,
@@ -1083,7 +1084,8 @@ export function KanbanBoardPage() {
   const k = useKanban()
   const qc = useQueryClient()
   const slug = useValue($boardSlug)
-  const [archived, setArchived] = useState(false)
+  const archived = useValue($showArchived)
+  const setArchived = $showArchived.set
 
   // Live updates ride the events socket (bindApi); this interval is only the
   // slow heartbeat for socketless paths (OAuth remotes, dropped connections).
@@ -1320,6 +1322,12 @@ export function KanbanBoardPage() {
     $collapsedLanes.set(overrides)
   }
 
+  // The board's live count ("N") plus the archived chip. On a fully drained
+  // board (every card archived) `total` alone is indistinguishable from a
+  // wiped board, so the archived count stays visible without opening the
+  // filter menu; clicking it flips Show archived on.
+  const archivedCount = filtered?.archived_count ?? 0
+
   return (
     <div className="relative flex h-full flex-col overflow-hidden bg-(--ui-surface-background)">
       {/* Page-owned titlebar chrome: exists exactly while this page is mounted. */}
@@ -1332,6 +1340,17 @@ export function KanbanBoardPage() {
         <span className="rounded-full bg-(--ui-bg-quaternary) px-1.5 py-px text-[0.625rem] tabular-nums text-(--ui-text-tertiary)">
           {total}
         </span>
+        {!archived && archivedCount > 0 && (
+          <button
+            aria-label={`${archivedCount} ${k.chipArchived}`}
+            className="rounded-full bg-(--ui-bg-quaternary) px-1.5 py-px text-[0.625rem] tabular-nums text-(--ui-text-tertiary)"
+            data-testid="archived-count-chip"
+            onClick={() => $showArchived.set(true)}
+            type="button"
+          >
+            {archivedCount} {k.chipArchived}
+          </button>
+        )}
         {board && (
           <FilterMenu
             archived={archived}

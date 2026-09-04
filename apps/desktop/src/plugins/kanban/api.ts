@@ -55,10 +55,17 @@ export const $lanesByProfile = atom<boolean>(false)
  *  auto: empty lanes collapse to a rail, occupied lanes expand. Persisted. */
 export const $collapsedLanes = atom<Record<string, boolean>>({})
 
+/** Whether the board shows the archived lane. Persisted per install. The
+ *  dashboard config knob `dashboard.kanban.include_archived_by_default`
+ *  seeds it ONLY on first run (before any explicit choice is stored) — after
+ *  that the user's toggle wins, so the knob can't fight the operator. */
+export const $showArchived = atom<boolean>(false)
+
 const BOARD_SLUG_KEY = 'boardSlug'
 const INTRO_KEY = 'introDismissed'
 const LANES_KEY = 'lanesByProfile'
 const COLLAPSED_KEY = 'collapsedLanes'
+const SHOW_ARCHIVED_KEY = 'showArchived'
 
 /** One live `task_events` frame → precise cache invalidation: the board, plus
  *  each touched task's detail. The polls (8s board / 4s drawer) stay as the
@@ -117,6 +124,23 @@ export function bindApi(
   persist($lanesByProfile, LANES_KEY, false)
   persist($collapsedLanes, COLLAPSED_KEY, {})
 
+  // Show-archived: restore the user's last choice; on a fresh install (no
+  // stored choice yet) seed from the dashboard config knob if it opts in —
+  // reviving the otherwise-unconsumed `include_archived_by_default` setting.
+  persist($showArchived, SHOW_ARCHIVED_KEY, false)
+  let disposed = false
+  if (storage.get(SHOW_ARCHIVED_KEY, null) === null) {
+    rest?.<{
+      config?: { include_archived_by_default?: boolean }
+    }>('/config')
+      .then(config => {
+        if (!disposed && config?.config?.include_archived_by_default && !$showArchived.get()) {
+          $showArchived.set(true)
+        }
+      })
+      .catch(() => undefined)
+  }
+
   let close: (() => void) | null = null
 
   const open = (slug: string) => {
@@ -128,6 +152,7 @@ export function bindApi(
   unsubs.push($boardSlug.listen(open))
 
   return () => {
+    disposed = true
     unsubs.forEach(unsub => unsub())
     close?.()
     rest = null
