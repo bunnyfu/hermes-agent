@@ -1,8 +1,23 @@
 # Review package — t_61bd3b39 (archived-count on board header + persisted Show archived)
 
-Commit: a9339fb0a5 on branch wt/archived-count (worktree
-/Users/ikavt/Developer/worktrees/hermes-agent/wt-archived-count), base
-63279301bc = the reviewed surface from verdict t_b502fe91.
+Commit: a9339fb0a5 + 600fe44497 (round 1 fix) on branch wt/archived-count
+(worktree /Users/ikavt/Developer/worktrees/hermes-agent/wt-archived-count),
+base 63279301bc = the reviewed surface from verdict t_b502fe91.
+
+## 0. Round-2 provenance (zombie-writer incident, disclosed)
+
+600fe44497 was authored by the round-1 REVIEWER process (run 36) AFTER that
+run had recorded its terminal `changes_requested` (board correctly refused
+its further lifecycle actions, but the host process kept acting on disk —
+edits 13:40–13:41, commit 13:45:38; same class as t_c156bef3, upstream fix
+in PR #102516). Run 37 (implementer fix round) terminated the zombie
+process, then ADOPTED nothing on trust: every claim in 600fe44497 was
+re-verified independently — RED discriminator reproduced (old nested guard
++ flat mock → seed test fails, 1 failed | 6 passed, run 37 @13:50), GREEN
+battery re-run (see §3 outputs), integrity re-proven (§3 baseline +
+append-only brute-force check). The provenance is disclosed here rather
+than history rewritten; the commit stands as verified content with an
+unconventional author path.
 
 ## 1. What was built
 
@@ -31,7 +46,7 @@ or child data are touched by any code path.
 - apps/desktop/src/plugins/kanban/i18n.ts — chipArchived x4 locales
 - apps/desktop/src/plugins/kanban/types.ts — archived_count on KanbanBoard
 - tests/plugins/test_kanban_dashboard_plugin.py — 3 backend cases
-- apps/desktop/src/plugins/kanban/archived-count.test.tsx — 6 UI cases
+- apps/desktop/src/plugins/kanban/archived-count.test.tsx — 7 UI cases
 - archive-fingerprint.py (worktree root) — integrity drill, see §5
 
 ## 3. How to verify (critic: re-run these)
@@ -72,13 +87,20 @@ Integrity (data untouched):
   delta must be a NEWLY archived card with a fresh completed_at, not a
   changed row on the three named boards, which are inert):
 
-  Baseline recorded 2026-09-04 ~13:20 (review round 1 re-run):
+  Baseline recorded 2026-09-04 13:41 (commit 600fe44497; hash values from
+  the round-1 reviewer process, re-verified by run 37 — quiescent boards
+  matched exactly; see §0 on that commit's provenance):
     d2-pass2    20 rows  aa1b94f160a440702f0c11f8c64dadfbc981eaf756940d0d642657a647946c20
     s1-research 18 rows  0507c463f350a2ff2538f7cd86343efa591273435c7348455f31a3569e013b81
     s1plus      34 rows  2c3f29eeb21f7f907304b8de6d3e243bd3ef741782ed0bba7f64f82e4d8d57ac
-    default     18 rows at implementer run (19 by round 1: +1 = card
-                t_b32859c1 archived 11:44:56Z by its own mission, live
-                growth)  d33e4a6fe3a374ac1149b8bd2cf9af34a674e9bbf373f0dc0d6e22641ea82bf1 (at 19)
+    default     19 rows at 13:41  d33e4a6fe3a374ac1149b8bd2cf9af34a674e9bbf373f0dc0d6e22641ea82bf1
+                (18 at implementer run; +1 = card t_b32859c1 archived
+                11:44:56Z by its own mission, live growth)
+  Run-37 re-check @13:53: default reads 21 rows (63bcfd56d2095902...) —
+  append-only growth PROVEN by exhaustive check: exactly one 2-card
+  exclusion from today's set (minus t_632c7acd, t_ea39c71b — archived
+  after 13:41 by fleet cleanup) reproduces the 13:41 hash; no archived
+  row mutated. Quiescent boards hash-identical.
   (Round-1 nit resolved: hashes are now recorded durably, here and in the
   fingerprint output, not just counts.)
 
@@ -109,10 +131,12 @@ Integrity (data untouched):
    real (long className strings); typecheck IS clean for all touched files.
 2. The 90-vs-89 count delta is a LIVE-BOARD delta, not data drift: default
    board archived 17 -> 18 between the critic's snapshot (2026-09-04 early)
-   and my run (and 18 -> 19 by round 1, card t_b32859c1 — identified
-   first-hand via completed_at, not assumed), while d2-pass2/s1-research/
-   s1plus are hash-identical. The durable per-board hash baseline now lives
-   in §3; future rounds compare against it, not against a prose claim.
+   and my run (18 -> 19 by round 1, card t_b32859c1; 19 -> 21 by round 2 —
+   t_632c7acd, t_ea39c71b), while d2-pass2/s1-research/s1plus are
+   hash-identical across every round, and run 37 PROVED default's growth
+   append-only (exhaustive set-membership check against the recorded 13:41
+   hash, see §3). The durable per-board hash baseline now lives in §3;
+   future rounds compare against it, not against a prose claim.
 3. include_archived_by_default seeding is once-per-install by design (spec
    said "initial value"); after the first explicit toggle the knob is
    ignored. Anyone expecting the knob to re-assert on every boot would
