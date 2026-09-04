@@ -15,6 +15,11 @@ The Show archived toggle moved from `useState(false)` to a persisted
 `$showArchived` atom (plugin storage, Intro-dismissal precedent) and is
 seeded ONCE from `dashboard.kanban.include_archived_by_default` on first run
 (no stored choice yet); a stored choice always outranks the knob afterwards.
+The seed reads the knob from GET /config's FLAT payload
+(`config?.include_archived_by_default`) — get_config (plugin_api.py:2043)
+returns the knob at the top level, beside default_tenant/lane_by_profile;
+round-1 review initially caught this code reading a fabricated `{config: …}`
+envelope that the endpoint never produces (fixed in this round).
 i18n: `chipArchived` added to en/ja/zh/zh-Hant. No archived rows, statuses,
 or child data are touched by any code path.
 
@@ -44,14 +49,16 @@ Backend (from the worktree; unset the env pin first — it outranks everything):
   proven pre-existing: hindsight-client not installed in /opt/anaconda3,
   error "lazy installs disabled (security.allow_lazy_installs=false)").
 
-Frontend (toolchain is installed at the MAIN checkout, not the worktree;
-the worktree's apps/desktop/node_modules is a sanctioned merged-symlink dir
-created by apps/desktop/scripts/merge-node-modules.sh — untracked scaffold):
+Frontend (toolchain is installed at the MAIN checkout, not the worktree —
+vitest and tsc binaries live in /Users/ikavt/.hermes/hermes-agent/node_modules/.bin/,
+NOT apps/desktop/node_modules/.bin; the worktree's apps/desktop/node_modules
+is a sanctioned merged-symlink dir created by
+apps/desktop/scripts/merge-node-modules.sh — untracked scaffold):
 
   cd /Users/ikavt/Developer/worktrees/hermes-agent/wt-archived-count/apps/desktop
   /Users/ikavt/.hermes/hermes-agent/node_modules/.bin/vitest run --project ui \
     src/plugins/kanban/archived-count.test.tsx
-  EXPECT: 6 passed, 0 unhandled errors
+  EXPECT: 7 passed, 0 unhandled errors
 
   /Users/ikavt/.hermes/hermes-agent/node_modules/.bin/tsc -p . --noEmit
   EXPECT: only 2 pre-existing errors in ../shared/src/*.test.ts (vitest
@@ -60,11 +67,20 @@ created by apps/desktop/scripts/merge-node-modules.sh — untracked scaffold):
 Integrity (data untouched):
 
   /opt/anaconda3/bin/python3 archive-fingerprint.py
-  EXPECT total_archived: 90, hashes identical to the baseline recorded in
-  the completion comment (default 18 / d2-pass2 20 / s1-research 18 /
-  s1plus 34). 90 vs the verdict's 89 = +1 card on the live default board
-  since the snapshot (fleet kept operating); the three named boards'
-  hashes match byte-for-byte from before my first commit.
+  EXPECT per-board counts + SHA-256 identical to the baseline below (the
+  default board may legitimately grow — fleet keeps operating; any such
+  delta must be a NEWLY archived card with a fresh completed_at, not a
+  changed row on the three named boards, which are inert):
+
+  Baseline recorded 2026-09-04 ~13:20 (review round 1 re-run):
+    d2-pass2    20 rows  aa1b94f160a440702f0c11f8c64dadfbc981eaf756940d0d642657a647946c20
+    s1-research 18 rows  0507c463f350a2ff2538f7cd86343efa591273435c7348455f31a3569e013b81
+    s1plus      34 rows  2c3f29eeb21f7f907304b8de6d3e243bd3ef741782ed0bba7f64f82e4d8d57ac
+    default     18 rows at implementer run (19 by round 1: +1 = card
+                t_b32859c1 archived 11:44:56Z by its own mission, live
+                growth)  d33e4a6fe3a374ac1149b8bd2cf9af34a674e9bbf373f0dc0d6e22641ea82bf1 (at 19)
+  (Round-1 nit resolved: hashes are now recorded durably, here and in the
+  fingerprint output, not just counts.)
 
 ## 4. The bar (from the card, quoted)
 
@@ -93,9 +109,10 @@ Integrity (data untouched):
    real (long className strings); typecheck IS clean for all touched files.
 2. The 90-vs-89 count delta is a LIVE-BOARD delta, not data drift: default
    board archived 17 -> 18 between the critic's snapshot (2026-09-04 early)
-   and my run, while d2-pass2/s1-research/s1plus are hash-identical. If the
-   critic wants a same-content comparison rather than count equality, the
-   fingerprint script provides it (re-run + compare per-board hashes).
+   and my run (and 18 -> 19 by round 1, card t_b32859c1 — identified
+   first-hand via completed_at, not assumed), while d2-pass2/s1-research/
+   s1plus are hash-identical. The durable per-board hash baseline now lives
+   in §3; future rounds compare against it, not against a prose claim.
 3. include_archived_by_default seeding is once-per-install by design (spec
    said "initial value"); after the first explicit toggle the knob is
    ignored. Anyone expecting the knob to re-assert on every boot would

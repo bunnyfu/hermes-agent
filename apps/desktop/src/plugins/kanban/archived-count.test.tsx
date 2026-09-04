@@ -168,9 +168,13 @@ describe('showArchived persistence (bindApi)', () => {
   })
 
   it('seeds include_archived_by_default from /config ONLY on first run', async () => {
+    // The REAL /config contract is FLAT (get_config in plugin_api.py returns
+    // the knob at the top level) — mock exactly that shape, not a fabricated
+    // {config: {...}} envelope (review round 1: the old mock masked a seed
+    // that could never fire in production).
     restMock.mockImplementation((path: string) =>
       path === '/config'
-        ? Promise.resolve({ config: { include_archived_by_default: true } })
+        ? Promise.resolve({ include_archived_by_default: true })
         : Promise.resolve({})
     )
 
@@ -187,6 +191,21 @@ describe('showArchived persistence (bindApi)', () => {
     const third = await bindApi()
     expect(third.mod.$showArchived.get()).toBe(false)
     third.dispose()
+  })
+
+  it('does NOT seed when /config reports the knob off (flat falsy shape)', async () => {
+    restMock.mockImplementation((path: string) =>
+      path === '/config'
+        ? Promise.resolve({ include_archived_by_default: false })
+        : Promise.resolve({})
+    )
+
+    const { mod, dispose } = await bindApi()
+    // Let any pending /config promise settle before asserting.
+    await new Promise(resolve => setTimeout(resolve, 0))
+    expect(mod.$showArchived.get()).toBe(false)
+    expect(store.has('showArchived')).toBe(false)
+    dispose()
   })
 })
 

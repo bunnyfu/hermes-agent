@@ -127,14 +127,15 @@ export function bindApi(
   // Show-archived: restore the user's last choice; on a fresh install (no
   // stored choice yet) seed from the dashboard config knob if it opts in —
   // reviving the otherwise-unconsumed `include_archived_by_default` setting.
+  // GET /config's payload is FLAT (get_config in plugin_api.py returns the
+  // knob at the top level, beside default_tenant/lane_by_profile) — no
+  // {config: ...} envelope exists anywhere in the chain (review round 1).
   persist($showArchived, SHOW_ARCHIVED_KEY, false)
   let disposed = false
   if (storage.get(SHOW_ARCHIVED_KEY, null) === null) {
-    rest?.<{
-      config?: { include_archived_by_default?: boolean }
-    }>('/config')
+    rest?.<{ include_archived_by_default?: boolean }>('/config')
       .then(config => {
-        if (!disposed && config?.config?.include_archived_by_default && !$showArchived.get()) {
+        if (!disposed && config?.include_archived_by_default && !$showArchived.get()) {
           $showArchived.set(true)
         }
       })
