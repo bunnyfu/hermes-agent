@@ -21,7 +21,10 @@ from typing import Dict, Tuple
 
 import pytest
 
-_MODULE = Path("plugins/platforms/photon/sidecar/send-format.mjs").resolve()
+# Resolve against this test file's location, not Path.cwd(): the suite must
+# pass identically invoked from the repo root and from tests/ (t_37ba444c).
+_REPO_ROOT = Path(__file__).resolve().parents[4]
+_MODULE = _REPO_ROOT / "plugins" / "platforms" / "photon" / "sidecar" / "send-format.mjs"
 
 _CASES: Dict[str, Tuple[str, str, str]] = {
     # name: (format, text, expected builder)
@@ -72,7 +75,6 @@ def verdicts() -> Dict[str, str]:
     run = subprocess.run(
         ["node", "--input-type=module", "-e", harness],
         input=json.dumps(payload),
-        cwd=Path.cwd(),
         text=True,
         capture_output=True,
         check=False,

@@ -13,7 +13,11 @@ import urllib.request
 from pathlib import Path
 
 
-_PATCHER = Path("plugins/platforms/photon/sidecar/patch-spectrum-mixed-attachments.mjs")
+# Resolve against this test file's location, not Path.cwd(): the suite must
+# pass identically invoked from the repo root and from tests/ (t_37ba444c).
+_REPO_ROOT = Path(__file__).resolve().parents[4]
+_SIDECAR_DIR = _REPO_ROOT / "plugins" / "platforms" / "photon" / "sidecar"
+_PATCHER = _SIDECAR_DIR / "patch-spectrum-mixed-attachments.mjs"
 
 
 def _sidecar_env(port: int) -> dict[str, str]:
@@ -35,10 +39,10 @@ def _free_port() -> int:
 def _write_sidecar_fixture(tmp_path: Path, *, sdk_available: bool) -> Path:
     sidecar = tmp_path / "sidecar"
     sidecar.mkdir()
-    shutil.copyfile("plugins/platforms/photon/sidecar/index.mjs", sidecar / "index.mjs")
+    shutil.copyfile(_SIDECAR_DIR / "index.mjs", sidecar / "index.mjs")
     # index.mjs imports sibling helper modules — copy every non-patch .mjs so
     # the fixture keeps working as helpers are extracted from index.mjs.
-    for helper in Path("plugins/platforms/photon/sidecar").glob("*.mjs"):
+    for helper in _SIDECAR_DIR.glob("*.mjs"):
         if helper.name in ("index.mjs", "patch-spectrum-mixed-attachments.mjs"):
             continue
         shutil.copyfile(helper, sidecar / helper.name)
@@ -244,7 +248,6 @@ def test_spectrum_patch_rewrites_the_imessage_mapper(tmp_path: Path) -> None:
 
     result = subprocess.run(
         ["node", str(_PATCHER), str(tmp_path)],
-        cwd=Path.cwd(),
         text=True,
         capture_output=True,
         check=False,
@@ -266,7 +269,6 @@ def test_spectrum_patch_rewrites_the_imessage_mapper(tmp_path: Path) -> None:
     # Re-running is a no-op (idempotent self-heal on every sidecar start).
     again = subprocess.run(
         ["node", str(_PATCHER), str(tmp_path)],
-        cwd=Path.cwd(),
         text=True,
         capture_output=True,
         check=False,
