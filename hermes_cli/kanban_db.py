@@ -2553,6 +2553,7 @@ def complete_task(
     summary: Optional[str] = None, metadata: Optional[dict] = None,
     created_cards: Optional[Iterable[str]] = None, expected_run_id: Optional[int] = None,
     fire_lifecycle_hook: bool = True,
+    actor_session_id: Optional[str] = None, actor_profile: Optional[str] = None,
 ) -> bool:
     """``running|ready|blocked|review -> done``; records ``result``.
 
@@ -2563,6 +2564,16 @@ def complete_task(
     ``created_cards`` are verified first — a phantom id raises
     :class:`HallucinatedCardsError` after an auditable event; afterwards the
     prose is scanned for unresolvable ``t_<hex>`` refs (advisory event only).
+
+    ``actor_session_id``/``actor_profile`` record WHICH calling context closed
+    the task, on the ``completed`` event payload. The run the completion is
+    stamped with is whichever run held the claim at write time — when a second
+    agent context of the same profile completes over a live claim (incident
+    t_fd052480: a desktop session's ``hermes kanban complete`` was stamped with
+    the dispatcher worker's run id 23), the event is the only place the real
+    caller stays visible. Not caller-writable through the CLI/tool surfaces:
+    each handler passes its own env-derived identity, same forgery rule as
+    comment author.
     """
     now = int(time.time())
     # Cheap pre-check; re-checked inside the txn to close the parent-reopen race.
@@ -2616,9 +2627,18 @@ def complete_task(
         event_summary = handoff_summary
         if prior_status == "review" and not event_summary:
             event_summary = _REVIEW_APPROVED_NOTE
+        payload = _completed_event_payload(result, event_summary, verified_cards, metadata)
+        # Caller binding: the session/profile that executed the completion,
+        # distinct from the run id the write landed on. Empty env values are
+        # normalized to absent so historical rows (all-NULL provenance) and
+        # "known to be nobody" stay unambiguous in queries.
+        if actor_session_id and actor_session_id.strip():
+            payload["actor_session_id"] = actor_session_id.strip()
+        if actor_profile and actor_profile.strip():
+            payload["actor_profile"] = actor_profile.strip()
         _append_event(
             conn, task_id, "completed",
-            _completed_event_payload(result, event_summary, verified_cards, metadata),
+            payload,
             run_id=run_id,
         )
     _flag_phantom_prose_refs(conn, task_id, run_id, summary, result, verified_cards)

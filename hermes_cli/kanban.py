@@ -728,7 +728,8 @@ def _cmd_comment(args: argparse.Namespace) -> int:
             body = body[: max(0, args.max_len - len(suffix))].rstrip() + suffix
     author = args.author or _profile_author()
     with kbc.connect_closing() as conn:
-        kb.add_comment(conn, args.task_id, author, body)
+        kb.add_comment(conn, args.task_id, author, body,
+                       session_id=_cli_actor()["session_id"])
     print(f"Comment added to {args.task_id}")
     return 0
 
@@ -790,6 +791,21 @@ def _worker_run_id_for(task_id: str) -> Optional[int]:
         return int(raw)
     except ValueError:
         return None
+
+
+def _cli_actor() -> dict:
+    """Caller identity for lifecycle provenance (completion events, comment
+    authorship): the session id and profile of THIS process, read from the
+    runtime env. A dispatcher worker, a local CLI worker, and a second agent
+    context of the same profile each stamp their own values — so when a
+    completion lands on a run its caller does not own (incident t_fd052480:
+    a desktop session's ``kanban complete`` was attributed to the worker's
+    run id), the event still names the real caller. Same no-override rule as
+    comment author: callers cannot supply these; they are env-derived only."""
+    session_id = (os.environ.get("HERMES_SESSION_ID") or "").strip() or None
+    profile = (os.environ.get("HERMES_PROFILE_NAME")
+               or os.environ.get("HERMES_PROFILE") or "").strip() or None
+    return {"session_id": session_id, "profile": profile}
 
 
 def _goal_mode_handoff_rejection(task: Optional[kb.Task], evidence: str):
@@ -869,8 +885,11 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 fail_msg[tid] = gate_err
                 return False
             fail_msg[tid] = f"cannot complete {tid} (unknown id or terminal state)"
-            return kb.complete_task(conn, tid, result=args.result, summary=summary, metadata=metadata,
-                                    expected_run_id=_worker_run_id_for(tid))
+            actor = _cli_actor()
+            return kb.complete_task(
+                conn, tid, result=args.result, summary=summary, metadata=metadata,
+                expected_run_id=_worker_run_id_for(tid),
+                actor_session_id=actor["session_id"], actor_profile=actor["profile"])
 
         return _bulk_apply(ids, op, lambda tid: f"Completed {tid}", fail_msg.__getitem__)
 
@@ -889,7 +908,8 @@ def _commented(conn, reason: Optional[str], author, prefix: str, op):
     """Wrap a per-task ``op`` so a ``reason`` is first recorded as a ``PREFIX: reason`` comment."""
     def run(tid):
         if reason:
-            kb.add_comment(conn, tid, author, f"{prefix}: {reason}")
+            kb.add_comment(conn, tid, author, f"{prefix}: {reason}",
+                           session_id=_cli_actor()["session_id"])
         return op(tid)
     return run
 
@@ -989,7 +1009,8 @@ def _cmd_reopen_review(args: argparse.Namespace) -> int:
             if not kb.reopen_review_task(conn, tid):
                 return False
             if reason:
-                kb.add_comment(conn, tid, author or "operator", f"CHANGES REQUESTED: {reason}")
+                kb.add_comment(conn, tid, author or "operator", f"CHANGES REQUESTED: {reason}",
+                               session_id=_cli_actor()["session_id"])
             return True
 
         return _bulk_apply(ids, op, lambda tid: f"Reopened {tid}{suffix}",
