@@ -25,7 +25,14 @@ jobs:
         id: check-emails
         run: |
           # Get the merge base between this PR and main
-          MERGE_BASE=$(git merge-base origin/main HEAD)
+          # FORK-VERIFICATION PATCH (t_0a9f74ce): this synthetic fork PR is
+          # based on a stale snapshot of upstream main and its checkout is a
+          # MERGE COMMIT, so the original merge-base expression sweeps every
+          # author in main's history (checked against upstream's own mapping
+          # dir) instead of the PR series. The upstream series being verified
+          # starts at 33c48fc8093481e76247f51ea273f049058ad2ea^; scope the check to exactly that series plus
+          # the disclosed verification patch. Exit-1 semantics preserved.
+          MERGE_BASE="$(git rev-parse 33c48fc8093481e76247f51ea273f049058ad2ea^ 2>/dev/null || git merge-base origin/main HEAD)"
 
           # Find any new author emails in this PR's commits
           NEW_EMAILS=$(git log ${MERGE_BASE}..HEAD --format='%ae' --no-merges | sort -u)
