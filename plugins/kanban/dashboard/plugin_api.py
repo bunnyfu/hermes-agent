@@ -36,6 +36,7 @@ the port.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import sqlite3
@@ -210,6 +211,8 @@ def _attachment_dict(a: kanban_db.Attachment) -> dict[str, Any]:
         "uploaded_by": a.uploaded_by,
         "stored_path": a.stored_path,
         "created_at": a.created_at,
+        # None for legacy rows written before the digest was recorded.
+        "sha256": a.sha256,
     }
 
 
@@ -785,6 +788,11 @@ async def upload_task_attachment(
             content_type=file.content_type,
             size=total,
             uploaded_by=(uploaded_by or "dashboard"),
+            # Hash the completed on-disk blob (the upload streams in chunks,
+            # so the bytes were never held whole) — same digest the shared
+            # write path records for the tool/CLI surfaces. Kept local: the
+            # kanban-complete hashing idiom lives inside kanban_db.
+            sha256=hashlib.sha256(dest_path.read_bytes()).hexdigest(),
         )
         att = kanban_db.get_attachment(conn, att_id)
         return {"attachment": _attachment_dict(att) if att else None}
