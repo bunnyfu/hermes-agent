@@ -61,7 +61,10 @@ jobs:
             runner: macos-latest
             marker: macos_only
           - name: Windows-only tests
-            runner: windows-latest-32-core
+            # Fork CI receipt base (t_df0cad50): windows-latest-32-core is a
+            # paid larger runner; the free fork schedules only the standard
+            # windows-latest tier.
+            runner: windows-latest
             marker: windows_only
     steps:
       - name: Checkout code
