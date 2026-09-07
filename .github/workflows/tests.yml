@@ -24,11 +24,12 @@ jobs:
     # Fork CI receipt base (t_df0cad50): ubuntu-latest-96-core is a paid
     # larger runner never schedulable on the free fork; cap to the standard
     # tier so the identical suite actually runs instead of rotting in queue.
-    # Same tests, different hardware. Timeout raised 30 -> 90: the 30-min
-    # budget is calibrated for 96-core (suite ~2 min there); standard-tier
-    # runners need ~35+ min and were killed mid-suite at exactly 30:35.
+    # Same tests, different hardware. Timeout raised 30 -> 300: the 30-min
+    # budget assumes 96 cores; the 4-core tier needs ~4h at 16 workers
+    # (measured: diagnostic run 34105014366, 2495.8s suite at 96 workers),
+    # and the GitHub-imposed 6h job cap is the real ceiling.
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 300
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -127,12 +128,12 @@ jobs:
           # Workers above the core count only add contention.
           # Fork CI receipt base (t_df0cad50): 96 workers saturate the
           # 96-core upstream runner; on the free fork's 4-core standard
-          # tier they are 24x oversubscribed and shake out ~58 timing-
-          # sensitive failures (proven in diagnostic run 34105014366:
-          # 41612 passed / 58 failed, all timeout/lease/lifecycle races,
-          # in 2495.8s). One worker per core wins per the measurement
-          # below; 4 workers on 4 cores matches local-dev conditions.
-          HERMES_TEST_WORKERS: 4
+          # tier they are 24x oversubscribed and shook out 58 timing-
+          # sensitive failures in diagnostic run 34105014366 (41612
+          # passed / 58 failed, all timeout/lease/lifecycle races, in
+          # 2495.8s). 16 workers cut oversubscription to 4x while keeping
+          # projected wall time (~4.2h) inside the 6h job cap.
+          HERMES_TEST_WORKERS: 16
           # Ensure tests don't accidentally call real APIs
           OPENROUTER_API_KEY: ""
           OPENAI_API_KEY: ""
