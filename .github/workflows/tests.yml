@@ -125,7 +125,14 @@ jobs:
           # across a 6x range. The suite has sufficient concurrency at this
           # size. The remaining time is the slowest files plus the setup.
           # Workers above the core count only add contention.
-          HERMES_TEST_WORKERS: 96
+          # Fork CI receipt base (t_df0cad50): 96 workers saturate the
+          # 96-core upstream runner; on the free fork's 4-core standard
+          # tier they are 24x oversubscribed and shake out ~58 timing-
+          # sensitive failures (proven in diagnostic run 34105014366:
+          # 41612 passed / 58 failed, all timeout/lease/lifecycle races,
+          # in 2495.8s). One worker per core wins per the measurement
+          # below; 4 workers on 4 cores matches local-dev conditions.
+          HERMES_TEST_WORKERS: 4
           # Ensure tests don't accidentally call real APIs
           OPENROUTER_API_KEY: ""
           OPENAI_API_KEY: ""
