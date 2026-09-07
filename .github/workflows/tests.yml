@@ -24,9 +24,11 @@ jobs:
     # Fork CI receipt base (t_df0cad50): ubuntu-latest-96-core is a paid
     # larger runner never schedulable on the free fork; cap to the standard
     # tier so the identical suite actually runs instead of rotting in queue.
-    # Same tests, different hardware.
+    # Same tests, different hardware. Timeout raised 30 -> 90: the 30-min
+    # budget is calibrated for 96-core (suite ~2 min there); standard-tier
+    # runners need ~35+ min and were killed mid-suite at exactly 30:35.
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 90
     steps:
       - name: Checkout code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
