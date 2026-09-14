@@ -63,10 +63,11 @@ def _run_state_kwargs(args: argparse.Namespace, cmd: str) -> tuple[Optional[dict
     return ({} if st is None else {"state_type": st, "state_name": sn}), 0
 
 
-def _parse_workspace_flag(value: str) -> tuple[str, Optional[str]]:
-    """``--workspace`` -> ``(kind, path|None)``: ``scratch``, ``worktree``, ``worktree:<p>``, ``dir:<p>``."""
+def _parse_workspace_flag(value: Optional[str]) -> tuple[Optional[str], Optional[str]]:
+    """``--workspace`` -> ``(kind, path|None)``: ``scratch``, ``worktree``, ``worktree:<p>``, ``dir:<p>``.
+    Omitted -> ``(None, None)`` so ``create_task`` can tell "default" from an explicit scratch."""
     if not value:
-        return ("scratch", None)
+        return (None, None)
     v = value.strip()
     if v in {"scratch", "worktree"}:
         return (v, None)
@@ -191,7 +192,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             return _err(f"kanban: unknown action {action!r}", 2)
         try:
             return int(handler(args) or 0)
-        except (ValueError, RuntimeError) as exc:
+        except (ValueError, RuntimeError, PermissionError) as exc:
             return _err(f"kanban: {exc}")
 
 
@@ -215,12 +216,13 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "claim", "comment", "attach", "attach-rm", "complete", "edit", "block",
     "schedule", "unblock", "promote", "archive", "dispatch", "daemon", "repair",
     "heartbeat", "notify-subscribe", "notify-unsubscribe", "specify", "decompose",
+    "request-review", "request-changes", "reopen-review",
     "gc",
 })
 
 _DELEGATED_CHILD_DENIED_BOARD_ACTIONS: frozenset[str] = frozenset({
     "create", "new", "rm", "remove", "delete", "switch", "use", "rename",
-    "set-default-workdir",
+    "set-default-workdir", "import",
 })
 
 
@@ -340,6 +342,8 @@ def _cmd_assignees(args: argparse.Namespace) -> int:
 
 
 def _cmd_create(args: argparse.Namespace) -> int:
+    from agent.delegation_context import is_dispatcher_owned_worker_context
+
     try:
         ws_kind, ws_path = _parse_workspace_flag(args.workspace)
         branch_name = _parse_branch_flag(getattr(args, "branch", None))
@@ -368,7 +372,10 @@ def _cmd_create(args: argparse.Namespace) -> int:
             provider_override=getattr(args, "provider_override", None),
             goal_mode=bool(getattr(args, "goal_mode", False)),
             goal_max_turns=getattr(args, "goal_max_turns", None),
+            completion_contract=getattr(args, "completion_contract", None),
             initial_status=getattr(args, "initial_status", "running"),
+            creator_task_id=(os.environ.get("HERMES_KANBAN_TASK")
+                             if is_dispatcher_owned_worker_context() else None),
         )
         task = kb.get_task(conn, task_id)
     if getattr(args, "json", False):
@@ -737,6 +744,7 @@ def _cmd_attach(args: argparse.Namespace) -> int:
     """Attach a local file via the shared ``store_attachment_bytes`` path (same 25 MB cap and name
     sanitisation as the dashboard upload and agent tool)."""
     import mimetypes
+    _worker_run_id_for(args.task_id)
 
     src = Path(args.path).expanduser()
     if not src.is_file():
@@ -783,6 +791,9 @@ def _cmd_attach_rm(args: argparse.Namespace) -> int:
 
 
 def _worker_run_id_for(task_id: str) -> Optional[int]:
+    env_tid = os.environ.get("HERMES_KANBAN_TASK")
+    if env_tid and env_tid != task_id:
+        raise ValueError(f"worker is scoped to task {env_tid}; refusing to mutate {task_id}")
     raw = os.environ.get("HERMES_KANBAN_RUN_ID")
     if os.environ.get("HERMES_KANBAN_TASK") != task_id or not raw:
         return None
@@ -928,6 +939,8 @@ def _cmd_schedule(args: argparse.Namespace) -> int:
 
 
 def _cmd_unblock(args: argparse.Namespace) -> int:
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        return _err("kanban unblock is orchestrator-only; workers must hand off their assigned task")
     ids, rc = _require_ids(args)
     if rc:
         return rc
@@ -1001,13 +1014,13 @@ def _cmd_promote(args: argparse.Namespace) -> int:
     author = _profile_author()
     # Dedupe while preserving order; positional task_id always first.
     ids = list(dict.fromkeys(_bulk_ids(args)))
-    dry_run, force = bool(args.dry_run), bool(args.force)
+    dry_run = bool(args.dry_run)
 
     results: list[dict[str, object]] = []
     with kbc.connect_closing() as conn:
         for tid in ids:
-            ok, err = kb.promote_task(conn, tid, actor=author, reason=reason, force=force, dry_run=dry_run)
-            results.append({"task_id": tid, "promoted": ok, "dry_run": dry_run, "forced": force,
+            ok, err = kb.promote_task(conn, tid, actor=author, reason=reason, dry_run=dry_run)
+            results.append({"task_id": tid, "promoted": ok, "dry_run": dry_run,
                             "reason": reason, "error": err})
 
     failed = [r for r in results if not r["promoted"]]
@@ -1149,9 +1162,11 @@ def _cmd_context(args: argparse.Namespace) -> int:
 
 
 def _run_triage_sweep(args: argparse.Namespace, verb: str, mod, run_one, json_key: str,
-                      json_fields: tuple[str, ...], human_ok) -> int:
+                      json_fields: tuple[str, ...], human_ok,
+                      target_board: Optional[str] = None) -> int:
     """Shared driver for ``specify`` / ``decompose``: validate ids (one task id XOR ``--all``), run
-    ``run_one(tid, author=...)`` per id, print JSON or human lines, exit code."""
+    ``run_one(tid, author=...)`` per id, print JSON or human lines, exit code.
+    ``target_board`` (decompose only) is passed through to every ``run_one`` call."""
     all_flag = bool(getattr(args, "all_triage", False))
     author = getattr(args, "author", None) or _profile_author()
     want_json = bool(getattr(args, "json", False))
@@ -1173,7 +1188,12 @@ def _run_triage_sweep(args: argparse.Namespace, verb: str, mod, run_one, json_ke
 
     ok_count = 0
     for tid in ids:
-        outcome = run_one(tid, author=author)
+        # specify has no board target (single-task promotion); decompose passes
+        # it through. The None branch keeps the legacy exact call shape.
+        if target_board:
+            outcome = run_one(tid, author=author, board=target_board)
+        else:
+            outcome = run_one(tid, author=author)
         if outcome.ok:
             ok_count += 1
         if want_json:
@@ -1203,8 +1223,11 @@ def _cmd_specify(args: argparse.Namespace) -> int:
 
 def _decompose_ok_line(o) -> str:
     if o.fanout and o.child_ids:
+        root_note = ""
+        if o.root_board_status is not None:
+            root_note = f"; root stays {o.root_board_status} (children on target board)"
         return (f"Decomposed {o.task_id} → {len(o.child_ids)} "
-                f"children ({', '.join(o.child_ids)}); root promoted to todo")
+                f"children ({', '.join(o.child_ids)}){root_note}")
     return f"Specified {o.task_id} → todo (no fanout){_retitled_suffix(o)}"
 
 
@@ -1212,8 +1235,28 @@ def _cmd_decompose(args: argparse.Namespace) -> int:
     """Fan a triage task (or all) out into child tasks via the auxiliary LLM."""
     from hermes_cli import kanban_decompose as decomp
 
+    # Validate the child-target board up front (clean CLI error, not a
+    # mid-decomposition failure). ``--board default`` is always legal; other
+    # slugs must exist — matching the top-level --board guard in
+    # kanban_command. dest is target_board: the parent parser owns --board
+    # (the root's board) and subparser defaults would clobber it in the
+    # shared namespace.
+    target_board = (getattr(args, "target_board", None) or "").strip() or None
+    if target_board:
+        try:
+            normed = kb._normalize_board_slug(target_board)
+        except ValueError as exc:
+            return _err(f"kanban: {exc}", 2)
+        if not normed:
+            return _err("kanban: decompose --board requires a slug", 2)
+        if normed != kb.DEFAULT_BOARD and not kb.board_exists(normed):
+            return _err(f"kanban: board {normed!r} does not exist. "
+                        f"Create it with `hermes kanban boards create {normed}`.")
+        target_board = normed
+
     return _run_triage_sweep(args, "decompose", decomp, decomp.decompose_task, "decomposed",
-                             ("task_id", "ok", "reason", "fanout", "child_ids", "new_title"), _decompose_ok_line)
+                             ("task_id", "ok", "reason", "fanout", "child_ids", "new_title"),
+                             _decompose_ok_line, target_board=target_board)
 
 
 _HANDLERS = {
