@@ -129,6 +129,7 @@ def _make_update_side_effect(
     update_ref_fails=False,
     pre_pull_sha_unavailable=False,
     existing_rescue_refs=None,
+    local_ahead_count="0",
 ):
     """Build a subprocess.run side_effect for cmd_update tests.
 
@@ -149,6 +150,10 @@ def _make_update_side_effect(
     ``existing_rescue_refs`` simulates the refs already present under
     ``refs/hermes-update-backups/orphan-<branch>-*`` (oldest first) so the
     ``_prune_orphan_rescue_refs`` cleanup pass has something to trim.
+
+    ``local_ahead_count`` answers the same-branch-ahead probes
+    (``rev-list --count origin/<branch>..<pre-pull-sha>``); the default "0"
+    keeps the behind-only shape, "1" arms the diverged rescue-ref guard.
     """
     recorded = []
     head_sha_calls = []
@@ -181,6 +186,11 @@ def _make_update_side_effect(
         if "checkout" in joined and "main" in joined:
             return SimpleNamespace(stdout="", stderr="", returncode=0)
         if "rev-list" in joined:
+            if "--count" in joined and "HEAD" not in joined:
+                # Same-branch-ahead probe from _reconcile_diverged_checkout
+                # (SHA..origin and origin..SHA — the pre-pull SHA literal, so
+                # "HEAD" never appears). Default keeps the behind-only shape.
+                return SimpleNamespace(stdout=f"{local_ahead_count}\n", stderr="", returncode=0)
             return SimpleNamespace(stdout=f"{commit_count}\n", stderr="", returncode=0)
         if "merge-base" in joined:
             if merge_base_exists:
@@ -401,8 +411,9 @@ def test_prune_orphan_rescue_refs_leaves_unparseable_names_alone():
 
 
 def test_cmd_update_ordinary_divergence_skips_rescue_ref(monkeypatch, tmp_path, capsys):
-    """Common ancestor still exists (e.g. upstream force-push) → no rescue
-    ref, no orphan messaging, behavior identical to before #87694."""
+    """Behind-only divergence with a common ancestor (e.g. a true upstream
+    force-push with zero local commits) → no rescue ref, no backup messaging,
+    behavior identical to before the same-branch-ahead guard existed."""
     _setup_update_mocks(monkeypatch, tmp_path)
 
     side_effect, recorded = _make_update_side_effect(
@@ -416,8 +427,47 @@ def test_cmd_update_ordinary_divergence_skips_rescue_ref(monkeypatch, tmp_path, 
     assert update_ref_calls == []
 
     out = capsys.readouterr().out
+    # "(diverged)" is the backup-path message; the reset line's "history diverged" is exempt.
+    assert "has commits not on origin" not in out
     assert "orphan divergence" not in out
     assert "Fast-forward not possible (history diverged), resetting to match remote" in out
+
+
+def test_cmd_update_same_branch_ahead_backs_up_before_reset(monkeypatch, tmp_path, capsys):
+    """Same branch, common ancestor, local commits origin lacks (the desktop
+    handoff shape that silently destroyed local main three times): HEAD is
+    parked behind a ``refs/hermes-update-backups/diverged-*`` ref — carrying
+    the pre-pull SHA — before ``reset --hard`` proceeds."""
+    _setup_update_mocks(monkeypatch, tmp_path)
+
+    side_effect, recorded = _make_update_side_effect(
+        ff_only_fails=True, merge_base_exists=True, local_ahead_count="1",
+    )
+    monkeypatch.setattr(hermes_main.subprocess, "run", side_effect)
+
+    hermes_main.cmd_update(SimpleNamespace())
+
+    update_ref_calls = [c for c in recorded if "update-ref" in " ".join(str(x) for x in c)]
+    assert len(update_ref_calls) == 1
+    ref_name = update_ref_calls[0][update_ref_calls[0].index("update-ref") + 1]
+    assert ref_name.startswith("refs/hermes-update-backups/diverged-main-")
+    assert update_ref_calls[0][update_ref_calls[0].index("update-ref") + 2] == (
+        "1111111111111111111111111111111111111beef"
+    )
+    assert ref_name.endswith("-111111111111")
+
+    reset_calls = [
+        c for c in recorded
+        if "reset" in " ".join(str(x) for x in c) and "--hard" in c
+    ]
+    assert len(reset_calls) == 1
+
+    out = capsys.readouterr().out
+    assert "diverged" in out
+    assert ref_name in out
+    assert "backed up current HEAD" in out
+    # The destructive reset still proceeds — this is a backup, not a merge stop.
+    assert "resetting to match remote" in out
 
 
 def test_cmd_update_orphan_rescue_ref_write_failure_is_non_fatal(monkeypatch, tmp_path, capsys):
@@ -1231,3 +1281,148 @@ def test_prune_orphan_rescue_refs_with_real_git_unpins_objects(tmp_path):
     # And gc can now reclaim the snapshot's objects.
     git("gc", "-q", "--prune=now")
     assert git("cat-file", "-e", snap_sha, check=False).returncode != 0
+
+
+# ---------------------------------------------------------------------------
+# Same-branch-ahead rescue ref, end-to-end with real git: `_reconcile_diverged_
+# checkout` must park the pre-pull HEAD behind refs/hermes-update-backups/
+# diverged-* before `reset --hard` destroys it, and the pruner must expire the
+# diverged kind under the same age/count rules as the orphan kind.
+# ---------------------------------------------------------------------------
+
+
+def test_reconcile_same_branch_ahead_rescue_ref_end_to_end_with_real_git(
+    tmp_path, monkeypatch
+):
+    """Real-git proof of the t_f1cef2f0 data-loss shape: local main ahead of
+    origin with a common ancestor. Before the fix this reset silently
+    destroyed ``local_only``; now the commit survives behind a ``diverged-``
+    rescue ref and the tree is reset to origin's state."""
+    import shutil
+    import subprocess
+
+    if shutil.which("git") is None:
+        pytest.skip("git not available")
+
+    # Keep every git call inside the fixture repo: _reconcile_diverged_checkout
+    # resolves cwd via _m().PROJECT_ROOT (unpatched it would act on THIS
+    # checkout). The prune pass stays no-op'd; per-kind retention is proven
+    # hermetically in test_prune_update_rescue_refs_with_real_git_*.
+    monkeypatch.setattr(hermes_main, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(update_cmd, "_prune_orphan_rescue_refs", lambda *a, **k: None)
+
+    def git(*args, check=True):
+        return subprocess.run(
+            ["git", *args], cwd=tmp_path, capture_output=True, text=True, check=check
+        )
+
+    git("init", "-q", "-b", "main")
+    git("config", "user.email", "t@example.com")
+    git("config", "user.name", "t")
+    (tmp_path / "f.txt").write_text("base\n")
+    git("add", "-A")
+    git("commit", "-qm", "base")
+    base = git("rev-parse", "HEAD").stdout.strip()
+
+    # origin/main: an independent force-pushed line with a shared ancestor
+    # (different file, so the recovery merge below can resolve cleanly).
+    git("branch", "origin-side", base)
+    git("checkout", "-q", "origin-side")
+    (tmp_path / "g.txt").write_text("remote\n")
+    git("add", "-A")
+    git("commit", "-qm", "remote side")
+    remote = git("rev-parse", "HEAD").stdout.strip()
+    git("update-ref", "refs/remotes/origin/main", remote)
+
+    # Local main: one commit origin lacks — the shape the desktop updater wipes.
+    git("checkout", "-q", "main")
+    (tmp_path / "h.txt").write_text("local_only\n")
+    git("add", "-A")
+    git("commit", "-qm", "local only")
+    local = git("rev-parse", "HEAD").stdout.strip()
+
+    # Reconcile premise: ff fails, common ancestor exists, local is ahead.
+    assert git("merge-base", "HEAD", "origin/main", check=False).returncode == 0
+    assert git("merge", "--ff-only", "origin/main", check=False).returncode != 0
+    assert git("rev-list", "--count", f"origin/main..{local}").stdout.strip() == "1"
+
+    update_cmd._reconcile_diverged_checkout(["git"], "main", local)
+
+    # The destructive reset happened (tree matches origin's line)…
+    assert git("rev-parse", "HEAD").stdout.strip() == remote
+    assert git("rev-parse", "main").stdout.strip() == remote
+    assert git("status", "--porcelain").stdout == ""
+    # …and the local commit survives behind the diverged rescue ref.
+    refs = git("for-each-ref", "--format=%(refname) %(objectname)", "refs/hermes-update-backups/").stdout
+    backup_rows = [line.split() for line in refs.splitlines() if line.strip()]
+    assert len(backup_rows) == 1, refs
+    ref_name, ref_sha = backup_rows[0]
+    assert ref_name.startswith("refs/hermes-update-backups/diverged-main-")
+    assert ref_sha == local
+    assert git("cat-file", "-e", f"{ref_name}^{{commit}}", check=False).returncode == 0
+    # Recovery remains a plain merge of the parked ref (non-overlapping edits).
+    recovered = git("merge", "--no-edit", ref_name, check=False)
+    assert recovered.returncode == 0, recovered.stderr
+    assert git("show", "main:f.txt").stdout == "base\n"
+    assert git("show", "main:g.txt").stdout == "remote\n"
+    assert git("show", "main:h.txt").stdout == "local_only\n"
+
+
+def test_prune_update_rescue_refs_with_real_git_kinds_are_independent(tmp_path):
+    """Real-git proof that the pruner tracks the diverged kind with the same
+    age/count rules as the orphan kind, and the two kinds' retention is
+    independent (per-kind keep caps, not one shared pool)."""
+    import shutil
+    import subprocess
+    from datetime import datetime, timedelta, timezone
+
+    if shutil.which("git") is None:
+        pytest.skip("git not available")
+
+    def git(*args, check=True):
+        return subprocess.run(
+            ["git", *args], cwd=tmp_path, capture_output=True, text=True, check=check
+        )
+
+    git("init", "-q", "-b", "main")
+    git("config", "user.email", "t@example.com")
+    git("config", "user.name", "t")
+    (tmp_path / "f.txt").write_text("base\n")
+    git("add", "-A")
+    git("commit", "-qm", "init")
+    sha = git("rev-parse", "HEAD").stdout.strip()
+
+    now = datetime.now(timezone.utc)
+    fresh = now.strftime("%Y%m%d-%H%M%S")
+    old = (now - timedelta(days=update_cmd._ORPHAN_RESCUE_REF_MAX_AGE_DAYS + 5)).strftime("%Y%m%d-%H%M%S")
+
+    refs = {
+        "fresh-diverged": f"refs/hermes-update-backups/diverged-main-{fresh}-{sha[:12]}",
+        "old-diverged": f"refs/hermes-update-backups/diverged-main-{old}-{sha[:12]}",
+        "fresh-orphan": f"refs/hermes-update-backups/orphan-main-{fresh}-{sha[:12]}",
+        "old-orphan": f"refs/hermes-update-backups/orphan-main-{old}-{sha[:12]}",
+    }
+    for ref in refs.values():
+        git("update-ref", ref, sha)
+
+    update_cmd._prune_orphan_rescue_refs(["git"], tmp_path, "main")
+
+    remaining = git("for-each-ref", "refs/hermes-update-backups/").stdout
+    # Age expiry applies per kind regardless of kind.
+    assert refs["old-diverged"] not in remaining
+    assert refs["old-orphan"] not in remaining
+    # Fresh refs of both kinds survive together.
+    assert refs["fresh-diverged"] in remaining
+    assert refs["fresh-orphan"] in remaining
+
+    # Count cap is per kind: keep=1 drops the older diverged ref BY STAMP
+    # (mid < fresh sorts first) within its own kind, never touching the
+    # other kind's only ref — retention pools are independent.
+    mid = (now - timedelta(minutes=5)).strftime("%Y%m%d-%H%M%S")
+    refs["mid-diverged"] = f"refs/hermes-update-backups/diverged-main-{mid}-000000000000"
+    git("update-ref", refs["mid-diverged"], sha)
+    update_cmd._prune_orphan_rescue_refs(["git"], tmp_path, "main", keep=1)
+    remaining = git("for-each-ref", "refs/hermes-update-backups/").stdout
+    assert refs["mid-diverged"] not in remaining   # older-by-stamp diverged → gone
+    assert refs["fresh-diverged"] in remaining     # newer diverged survives
+    assert refs["fresh-orphan"] in remaining       # orphan pool untouched

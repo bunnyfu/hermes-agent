@@ -1,4 +1,4 @@
-"""Git plumbing for ``hermes update``: fork/upstream sync, trampoline-git detection, lockfile/EOL churn cleanup, orphan rescue refs, parked-branch assessment, fetch-failure classification.
+"""Git plumbing for ``hermes update``: fork/upstream sync, trampoline-git detection, lockfile/EOL churn cleanup, update rescue refs, parked-branch assessment, fetch-failure classification.
 
 Split out of ``update_cmd.py``, which re-imports every name so ``hermes_cli.update_cmd.<name>``
 still resolves/monkeypatches. Origin helpers are imported lazily per function (no cycle;
@@ -41,12 +41,13 @@ def _git_stdout(git_cmd, args, cwd, **kw) -> Optional[str]:
 def _prune_orphan_rescue_refs(
     git_cmd, cwd, branch, keep=_ORPHAN_RESCUE_REFS_TO_KEEP, max_age_days=_ORPHAN_RESCUE_REF_MAX_AGE_DAYS
 ) -> None:
-    """Expire old orphan rescue refs (``refs/hermes-update-backups/orphan-<branch>-<ts>-<sha>``).
+    """Expire old update rescue refs (``refs/hermes-update-backups/{orphan,diverged}-<branch>-<ts>-<sha>``).
 
     Each ref pins a possibly multi-GB snapshot against ``git gc``, so a repeatedly corrupted install would
-    grow ``.git`` unbounded. Keep the ``keep`` newest AND drop any older than ``max_age_days`` by the
-    ``YYYYMMDD-HHMMSS`` stamp (unparseable names left alone); names sort chronologically so
-    ``for-each-ref`` order is creation order. Best-effort, never blocks.
+    grow ``.git`` unbounded. Per kind, keep the ``keep`` newest AND drop any older than ``max_age_days``
+    by the ``YYYYMMDD-HHMMSS`` stamp (unparseable names left alone); names sort chronologically so
+    ``for-each-ref`` order is creation order. Retention is per kind so one divergence shape's
+    backups never starve the other's. Best-effort, never blocks.
 
     A rescue ref pins every object reachable from that commit against ``git gc`` — and in the incident shape
     those objects include a full working-tree snapshot (the autostash orphan commit), which can be multi-GB
@@ -54,18 +55,24 @@ def _prune_orphan_rescue_refs(
     """
     from hermes_cli.update_cmd import _git_run
     with suppress(OSError):
-        prefix = f"refs/hermes-update-backups/orphan-{branch}-"
-        list_result = _git_run(git_cmd, ["for-each-ref", "--format=%(refname)", "--sort=refname", f"{prefix}*"], cwd)
-        if list_result.returncode != 0:
-            return
-        refs = [line.strip() for line in list_result.stdout.splitlines() if line.strip()]
-        stale = set(refs[:-keep] if keep > 0 else refs)
-        if max_age_days > 0:
-            cutoff = datetime.now(timezone.utc) - timedelta(days=max_age_days)
-            for ref in refs:
-                with suppress(ValueError):
-                    if datetime.strptime(ref[len(prefix):][:15], "%Y%m%d-%H%M%S").replace(tzinfo=timezone.utc) < cutoff:
-                        stale.add(ref)
+        stale: set[str] = set()
+        for kind in ("orphan", "diverged"):
+            prefix = f"refs/hermes-update-backups/{kind}-{branch}-"
+            list_result = _git_run(
+                git_cmd, ["for-each-ref", "--format=%(refname)", "--sort=refname", f"{prefix}*"], cwd)
+            if list_result.returncode != 0:
+                continue
+            kind_refs = [line.strip() for line in list_result.stdout.splitlines() if line.strip()]
+            expired = set()
+            if max_age_days > 0:
+                cutoff = datetime.now(timezone.utc) - timedelta(days=max_age_days)
+                for ref in kind_refs:
+                    with suppress(ValueError):
+                        if datetime.strptime(ref[len(prefix):][:15], "%Y%m%d-%H%M%S").replace(tzinfo=timezone.utc) < cutoff:
+                            expired.add(ref)
+            stale |= expired
+            survivors = [ref for ref in kind_refs if ref not in expired]
+            stale |= set(survivors[:-keep] if keep > 0 else survivors)
         for ref in sorted(stale):
             _git_run(git_cmd, ["update-ref", "-d", ref], cwd)
 
