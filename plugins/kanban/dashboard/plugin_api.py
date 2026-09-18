@@ -10,6 +10,7 @@ dispatcher's write txns); it carries its credential in the query string (browser
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import importlib
 import json
 import logging
@@ -187,7 +188,10 @@ def _attachment_dict(a: kanban_db.Attachment) -> dict[str, Any]:
     """``stored_path`` is the absolute on-disk path workers read; UI downloads by ``id``."""
     return {
         "id": a.id, "task_id": a.task_id, "filename": a.filename, "content_type": a.content_type,
-        "size": a.size, "uploaded_by": a.uploaded_by, "stored_path": a.stored_path, "created_at": a.created_at}
+        "size": a.size, "uploaded_by": a.uploaded_by, "stored_path": a.stored_path, "created_at": a.created_at,
+        # None for legacy rows written before the digest was recorded.
+        "sha256": a.sha256,
+    }
 
 
 def _placeholders(ids: list) -> str:
@@ -454,7 +458,13 @@ async def upload_task_attachment(
             raise HTTPException(status_code=500, detail=f"failed to store attachment: {exc}")
         att_id = kanban_db.add_attachment(
             conn, task_id, filename=dest_path.name, stored_path=str(dest_path.resolve()),
-            content_type=file.content_type, size=total, uploaded_by=(uploaded_by or "dashboard"))
+            content_type=file.content_type, size=total, uploaded_by=(uploaded_by or "dashboard"),
+            # Hash the completed on-disk blob (the upload streams in chunks,
+            # so the bytes were never held whole) — same digest the shared
+            # write path records for the tool/CLI surfaces. Kept local: the
+            # kanban-complete hashing idiom lives inside kanban_db.
+            sha256=hashlib.sha256(dest_path.read_bytes()).hexdigest(),
+        )
         att = kanban_db.get_attachment(conn, att_id)
         return {"attachment": _attachment_dict(att) if att else None}
 

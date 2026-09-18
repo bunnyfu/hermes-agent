@@ -1198,6 +1198,7 @@ class _FakeStreamResponse:
 
 def test_attach_url_happy_path_public_host(worker_env, default_url_guard, monkeypatch):
     """A public URL passes the guard and the bytes are stored (mocked fetch)."""
+    import hashlib
     from pathlib import Path
 
     import httpx
@@ -1231,5 +1232,61 @@ def test_attach_url_happy_path_public_host(worker_env, default_url_guard, monkey
         assert [a.filename for a in atts] == ["spec.pdf"]
         assert atts[0].content_type == "application/pdf"
         assert Path(atts[0].stored_path).read_bytes() == payload
+        # URL attach shares the write path → digest populated too.
+        assert atts[0].sha256 == hashlib.sha256(payload).hexdigest()
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# kanban_attach — inline base64 path records the blob's SHA-256
+# ---------------------------------------------------------------------------
+
+
+def test_attach_inline_records_sha256(worker_env):
+    """Inline kanban_attach stores a non-NULL sha256 matching the digest
+    of the bytes on disk.
+
+    Regression for the emitter-drift corruption class (t_b626f3f2): a
+    model can emit valid-but-wrong base64 for a long payload, so every
+    inline attachment row must carry the digest of the bytes as DECODED
+    by the handler — that is what makes stored-vs-intended drift
+    detectable downstream instead of silent.
+    """
+    import base64
+    import hashlib
+    from pathlib import Path
+
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    payload = (
+        b"inline attach payload for sha256 regression -- periodic "
+        b"QUFBQUFBQUFB padding to exercise the long-payload path"
+    )
+    content_b64 = base64.b64encode(payload).decode("ascii")
+
+    out = kt._handle_attach({
+        "filename": "inline-sha.bin",
+        "content_base64": content_b64,
+    })
+    d = json.loads(out)
+    assert d.get("ok") is True, out
+    # The response carries the digest of the decoded bytes so the caller
+    # can compare it against a digest of its own source bytes.
+    expected = hashlib.sha256(payload).hexdigest()
+    assert d["sha256"] == expected, out
+    assert d["size"] == len(payload)
+
+    conn = kb.connect()
+    try:
+        atts = kb.list_attachments(conn, worker_env)
+        assert [a.filename for a in atts] == ["inline-sha.bin"]
+        row = atts[0]
+        # The DB row digest matches both the response and the blob on disk.
+        assert row.sha256 == expected
+        stored = Path(row.stored_path).read_bytes()
+        assert stored == payload
+        assert row.sha256 == hashlib.sha256(stored).hexdigest()
     finally:
         conn.close()

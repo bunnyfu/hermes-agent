@@ -33,7 +33,9 @@ _HERMES_CORE_TOOLS = [
     "kanban_heartbeat",
     "kanban_comment", "kanban_create", "kanban_link",
     "kanban_unblock",
-    "kanban_attach", "kanban_attach_url", "kanban_attachments",
+    "kanban_attach", "kanban_attach_file", "kanban_attach_url",
+    "kanban_attachments",
+    # Computer use (macOS, gated on cua-driver being installed via check_fn)
     "computer_use",
     # Service-gated connector account status and authorization links.
     "manage_connections",
@@ -62,7 +64,6 @@ def _bundle(description, extras=()):
 def _core_without(*excluded, kanban=True):
     """_HERMES_CORE_TOOLS minus *excluded* (and, unless kanban=True, every kanban_* tool); order preserved."""
     return [t for t in _HERMES_CORE_TOOLS if t not in excluded and (kanban or not t.startswith("kanban_"))]
-
 
 # Coding posture: everything you reach for while pairing on code; drops messaging,
 # tts, image_gen, home-assistant, cron, kanban and computer-use.

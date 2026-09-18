@@ -8,11 +8,13 @@ shlex quoting of JSON metadata, structured-JSON failures). Humans use CLI/dashbo
 from __future__ import annotations
 
 import functools
+import hashlib
 import json
 import logging
 import os
 import time
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Any, Callable, Optional
 
 from agent.redact import redact_sensitive_text
@@ -21,6 +23,7 @@ from tools.registry import no_cache_check_fn, registry, tool_error
 from hermes_cli.config import cfg_get, load_config
 from tools.kanban_tools_schemas import (
     KANBAN_ATTACH_SCHEMA,
+    KANBAN_ATTACH_FILE_SCHEMA,
     KANBAN_ATTACH_URL_SCHEMA, KANBAN_ATTACHMENTS_SCHEMA, KANBAN_BLOCK_SCHEMA, KANBAN_COMMENT_SCHEMA,
     KANBAN_COMPLETE_SCHEMA, KANBAN_CREATE_SCHEMA, KANBAN_HEARTBEAT_SCHEMA, KANBAN_LINK_SCHEMA,
     KANBAN_LIST_SCHEMA, KANBAN_REQUEST_CHANGES_SCHEMA, KANBAN_REQUEST_REVIEW_SCHEMA,
@@ -752,19 +755,63 @@ def _handle_comment(args: dict, **kw) -> str:
         return _ok(task_id=tid, comment_id=cid)
 
 
-def _store_attachment(board, tid, filename, data, content_type) -> str:
-    """Store via ``kanban_db.store_attachment_bytes`` (shared size cap, per-task
-    dir, metadata row) so agent, dashboard, and CLI surfaces stay in lockstep."""
-    with _board(board) as (kb, conn):
-        att_id = kb.store_attachment_bytes(
-            conn, tid, str(filename), data,
-            content_type=content_type, uploaded_by="agent", board=board)
-        return _ok(task_id=tid, attachment_id=att_id, size=len(data))
+# Payload fragments that indicate the model emitted a made-up path/placeholder
+# instead of mechanically encoding the source file. Decoding to one of these
+# shapes is the exact signature of the 2026-09-05 t_2ae14d55 incident, where a
+# hallucinated ``L2FuZHJvaWQvLi4v`` decoded to ``/android/../`` and was stored
+# as a 12-byte "attachment" under ``ok:true``. Checked AFTER base64 validation
+# so the error message can show the decoded payload.
+_FABRICATED_PATH_PREFIXES = (
+    "/android/",
+    "/android",       # the incident fragment has no trailing slash
+    "/users/",
+    "/home/",
+    "/tmp/",
+    "/library/",
+    "/system/",
+    "/etc/",
+    "/var/",
+    "/private/",
+    "/volumes/",
+    "~/",
+    "../",
+    "./",
+)
+
+
+def _looks_like_fabricated_path(data: bytes) -> bool:
+    """Heuristic: does this decoded payload look like a path fragment?
+
+    Catches the placeholder family (a path string handed to
+    ``content_base64`` instead of the file's actual encoded bytes) without
+    outlawing any legitimate content: short binary/text payloads that begin
+    with ``/`` or ``.`` are rare, and any real file attach can bypass the
+    heuristic entirely via :func:`_handle_attach_file` (path-based, bytes
+    read server-side) or ``kanban_complete(artifacts=[...])``.
+    """
+    text = data.lstrip()[:64]
+    if not text:
+        return False
+    try:
+        probe = text.decode("utf-8")
+    except UnicodeDecodeError:
+        return False
+    lowered = probe.lower()
+    return any(lowered.startswith(prefix) for prefix in _FABRICATED_PATH_PREFIXES)
 
 
 @_kanban_handler("kanban_attach")
 def _handle_attach(args: dict, **kw) -> str:
-    """Attach an inline (base64) file to a task."""
+    """Attach an inline (base64) file to a task.
+
+    Integrity guard (t_2ae14d55, 2026-09-05): a payload that decodes to a
+    filesystem-path-looking fragment is refused as presumed fabrication —
+    the model composed a placeholder instead of encoding the source file —
+    and the stored row always records the payload's sha256, which this
+    result echoes so the caller can verify byte-identity. For on-disk
+    files prefer :func:`_handle_attach_file` (the model never touches the
+    bytes) or ``kanban_complete(artifacts=[...])``.
+    """
     tid = _worker_guard("kanban_attach", args)
     filename = _require_text(args, "filename")
     content_b64 = _require_text(args, "content_base64")
@@ -773,8 +820,96 @@ def _handle_attach(args: dict, **kw) -> str:
     try:
         data = base64.b64decode(str(content_b64), validate=True)
     except (binascii.Error, ValueError) as e:
-        raise _Reject(f"content_base64 is not valid base64: {e}")
-    return _store_attachment(args.get("board"), tid, filename, data, args.get("content_type"))
+        return tool_error(f"content_base64 is not valid base64: {e}")
+    if _looks_like_fabricated_path(data):
+        return tool_error(
+            "kanban_attach integrity guard: decoded payload looks like a "
+            f"filesystem-path fragment ({len(data)} bytes), not encoded file "
+            "content — refusing to store a fabricated placeholder. Encode "
+            "the source file mechanically (base64 of its full bytes), or "
+            "prefer kanban_attach_file with the source path, or "
+            "kanban_complete(artifacts=[...]) for on-disk deliverables."
+        )
+    board = args.get("board")
+    with _board(board) as (kb, conn):
+        att_id = kb.store_attachment_bytes(
+            conn, tid, str(filename), data,
+            content_type=args.get("content_type"), uploaded_by="agent", board=board)
+        return _ok(
+            task_id=tid,
+            attachment_id=att_id,
+            size=len(data),
+            sha256=hashlib.sha256(data).hexdigest(),
+            content_type=kb.derive_content_type(str(filename), args.get("content_type")),
+        )
+
+
+def _handle_attach_file(args: dict, **kw) -> str:
+    """Attach a file by absolute path — the path-based structural fix for
+    the t_2ae14d55 attach-corruption incident.
+
+    The worker passes a path to a file it can already read; the bytes are
+    loaded from disk server-side and stored via the shared
+    ``store_attachment_bytes`` path (integrity self-check on), so the model
+    never hand-encodes content at all — same trust level as the kernel-side
+    ``kanban_complete(artifacts=[...])`` channel. Byte-identity is enforced:
+    the stored row records the source's sha256 and the result echoes it.
+    """
+    from hermes_cli import kanban_db as kb
+
+    _reject_delegated_child_mutation("kanban_attach_file")
+    tid = _default_task_id(args.get("task_id"))
+    if not tid:
+        return tool_error(
+            "task_id is required (or set HERMES_KANBAN_TASK in the env)"
+        )
+    _enforce_worker_task_ownership(tid)
+    raw_path = args.get("path")
+    if not raw_path or not str(raw_path).strip():
+        return tool_error("path is required")
+    src = Path(str(raw_path)).expanduser()
+    if not src.exists():
+        return tool_error(f"kanban_attach_file: no such file: {src}")
+    if not src.is_file():
+        return tool_error(f"kanban_attach_file: not a file: {src}")
+    filename = args.get("filename") or src.name
+    content_type = args.get("content_type")
+    board = args.get("board")
+    try:
+        data = src.read_bytes()
+    except OSError as e:
+        return tool_error(f"kanban_attach_file: cannot read {src}: {e}")
+    digest = hashlib.sha256(data).hexdigest()
+    display_ct = kb.derive_content_type(str(filename), content_type)
+    try:
+        with _board(board) as (_, conn):
+            att_id = kb.store_attachment_bytes(
+                conn,
+                tid,
+                str(filename),
+                data,
+                content_type=content_type,
+                uploaded_by="agent",
+                board=board,
+                expected_size=len(data),
+                expected_sha256=digest,
+            )
+            return _ok(
+                task_id=tid,
+                attachment_id=att_id,
+                size=len(data),
+                sha256=digest,
+                content_type=display_ct,
+            )
+    except kb.AttachmentTooLarge as e:
+        return tool_error(f"kanban_attach_file: {e}")
+    except kb.AttachmentIntegrityError as e:
+        return tool_error(f"kanban_attach_file integrity guard: {e}")
+    except ValueError as e:
+        return tool_error(f"kanban_attach_file: {e}")
+    except Exception as e:
+        logger.exception("kanban_attach_file failed")
+        return tool_error(f"kanban_attach_file: {e}")
 
 
 _MAX_ATTACH_URL_REDIRECTS = 5
@@ -836,8 +971,32 @@ def _handle_attach_url(args: dict, **kw) -> str:
     except Exception as e:
         logger.exception("kanban_attach_url download failed")
         return tool_error(f"kanban_attach_url: failed to fetch {url}: {e}")
-    return _store_attachment(
-        args.get("board"), tid, filename, data, args.get("content_type") or fetched_ct)
+    board = args.get("board")
+    try:
+        with _board(board) as (_, conn):
+            att_id = kb.store_attachment_bytes(
+                conn,
+                tid,
+                str(filename),
+                data,
+                content_type=args.get("content_type") or fetched_ct,
+                uploaded_by="agent",
+                board=board,
+            )
+            return _ok(
+                task_id=tid,
+                attachment_id=att_id,
+                size=len(data),
+                sha256=hashlib.sha256(data).hexdigest(),
+                content_type=kb.derive_content_type(str(filename), args.get("content_type") or fetched_ct),
+            )
+    except kb.AttachmentTooLarge as e:
+        return tool_error(f"kanban_attach_url: {e}")
+    except ValueError as e:
+        return tool_error(f"kanban_attach_url: {e}")
+    except Exception as e:
+        logger.exception("kanban_attach_url failed")
+        return tool_error(f"kanban_attach_url: {e}")
 
 
 @_kanban_handler("kanban_attachments")
@@ -1036,3 +1195,12 @@ for _name, _sch, _handler, _emoji in _TOOLS:
     _gate = _check_kanban_orchestrator_mode if _name in _ORCHESTRATOR_TOOLS else _check_kanban_mode
     registry.register(name=_name, toolset="kanban", schema=_sch, handler=_handler, emoji=_emoji,
                       check_fn=_gate)
+
+registry.register(
+    name="kanban_attach_file",
+    toolset="kanban",
+    schema=KANBAN_ATTACH_FILE_SCHEMA,
+    handler=_handle_attach_file,
+    check_fn=_check_kanban_mode,
+    emoji="📎",
+)

@@ -12,6 +12,7 @@ The plugin router is attached to a bare FastAPI app — same approach as
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import sys
 from pathlib import Path
@@ -183,6 +184,9 @@ def test_upload_list_download_delete_roundtrip(client):
     att = r.json()["attachment"]
     assert att["filename"] == "notes.txt"
     assert att["size"] == len(content)
+    # The dashboard upload hashes the stored blob (same mechanism as the
+    # tool/CLI surfaces) and surfaces it in the response.
+    assert att["sha256"] == hashlib.sha256(content).hexdigest()
     att_id = att["id"]
 
     # List (drawer also embeds it in GET /tasks/:id)
@@ -248,6 +252,9 @@ def test_store_attachment_bytes_roundtrip(kanban_home):
         assert Path(a.stored_path).resolve().is_relative_to(
             kb.task_attachments_dir(task_id).resolve()
         )
+        # The shared write path records the blob's SHA-256 — the digest
+        # downstream integrity checks compare against.
+        assert a.sha256 == hashlib.sha256(b"some bytes").hexdigest()
     finally:
         conn.close()
 
@@ -279,6 +286,8 @@ def test_cli_attach_attachments_and_rm(kanban_home, tmp_path):
         att_id = atts[0].id
         assert atts[0].filename == "upload.txt"
         assert Path(atts[0].stored_path).read_bytes() == b"cli file body"
+        # CLI attach goes through the shared write path → digest populated.
+        assert atts[0].sha256 == hashlib.sha256(b"cli file body").hexdigest()
     finally:
         conn.close()
 

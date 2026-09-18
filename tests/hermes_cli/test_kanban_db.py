@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import hashlib
 import os
 import sqlite3
 import subprocess
@@ -168,6 +169,79 @@ def test_connect_migrates_legacy_db_before_optional_column_indexes(tmp_path):
     assert "idx_tasks_tenant" in indexes
     assert "idx_tasks_idempotency" in indexes
     assert "idx_events_run" in indexes
+
+
+def test_connect_migrates_task_attachments_sha256_column(tmp_path):
+    """task_attachments gains sha256 additively; legacy rows keep NULL.
+
+    The column exists in SCHEMA_SQL for fresh DBs, but boards created
+    before it must gain it via the additive migration pass — otherwise
+    every attach write would crash with "no such column: sha256" the
+    moment the code started populating it.
+    """
+    db_path = tmp_path / "legacy-attach-kanban.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.executescript(
+        """
+        CREATE TABLE tasks (
+            id TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            body TEXT,
+            assignee TEXT,
+            status TEXT NOT NULL,
+            priority INTEGER NOT NULL DEFAULT 0,
+            created_by TEXT,
+            created_at INTEGER NOT NULL,
+            started_at INTEGER,
+            completed_at INTEGER,
+            workspace_kind TEXT NOT NULL DEFAULT 'scratch',
+            workspace_path TEXT,
+            claim_lock TEXT,
+            claim_expires INTEGER
+        );
+        CREATE TABLE task_attachments (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id      TEXT NOT NULL,
+            filename     TEXT NOT NULL,
+            stored_path  TEXT NOT NULL,
+            content_type TEXT,
+            size         INTEGER NOT NULL DEFAULT 0,
+            uploaded_by  TEXT,
+            created_at   INTEGER NOT NULL
+        );
+        INSERT INTO tasks (id, title, status, created_at)
+        VALUES ('legacy', 'legacy attach task', 'ready', 1);
+        INSERT INTO task_attachments (task_id, filename, stored_path, size, created_at)
+        VALUES ('legacy', 'old.bin', '/tmp/old.bin', 3, 1);
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    with kb.connect(db_path) as migrated:
+        columns = {
+            row["name"]
+            for row in migrated.execute("PRAGMA table_info(task_attachments)")
+        }
+        legacy = migrated.execute(
+            "SELECT sha256 FROM task_attachments WHERE task_id = 'legacy'"
+        ).fetchone()
+
+    assert "sha256" in columns
+    # Existing rows keep NULL: the digest of a blob nobody recorded is
+    # unknown, not a sentinel zero value.
+    assert legacy["sha256"] is None
+
+    # And the migrated column is writable through the normal path.
+    with kb.connect(db_path) as conn:
+        task_id = kb.create_task(conn, title="post-migration")
+        digest = hashlib.sha256(b"fresh bytes").hexdigest()
+        att_id = kb.store_attachment_bytes(
+            conn, task_id, "fresh.bin", b"fresh bytes", uploaded_by="tester"
+        )
+        stored = kb.get_attachment(conn, att_id)
+    assert stored is not None
+    assert stored.sha256 == digest
 
 
 # ---------------------------------------------------------------------------
