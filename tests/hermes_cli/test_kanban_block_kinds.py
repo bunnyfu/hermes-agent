@@ -12,6 +12,8 @@ forever. The fix gives ``block_task`` a typed ``kind`` and a persistent
 * ``needs_input`` / ``capability`` / un-typed blocks land in ``blocked``;
   each same-cause re-block after an unblock increments ``block_recurrences``,
   and at ``BLOCK_RECURRENCE_LIMIT`` the task routes to ``triage`` for a human.
+  Counts WORKER-surface re-blocks only: non-worker ``needs_input`` blocks are
+  exempt from the counter entirely (park-vs-loop guard, 2026-09-19).
 * ``unblock_task`` deliberately does NOT reset ``block_recurrences`` (the
   amnesia that let the loop run unbounded).
 * A successful ``complete_task`` resets the loop memory.
@@ -20,7 +22,10 @@ forever. The fix gives ``block_task`` a typed ``kind`` and a persistent
 from __future__ import annotations
 
 import argparse
+import contextlib
+import os
 from pathlib import Path
+from typing import Iterator
 
 import pytest
 
@@ -28,6 +33,19 @@ from hermes_cli import kanban as kanban_cli
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_dispatch as kbd
+
+
+@contextlib.contextmanager
+def worker_surface(tid: str) -> Iterator[None]:
+    """Pin the WORKER blocking surface for *tid*: ``block_task`` tags its
+    surface from ``HERMES_KANBAN_TASK`` (present on dispatcher-spawned workers
+    only, scoped to their own task), and the tests below narrate a worker
+    re-block cycle on its own card."""
+    os.environ["HERMES_KANBAN_TASK"] = tid
+    try:
+        yield
+    finally:
+        os.environ.pop("HERMES_KANBAN_TASK", None)
 
 
 @pytest.fixture
@@ -130,7 +148,8 @@ def test_dependency_block_with_terminal_parents_parks_then_escalates(
 
         # `hermes kanban block <child> --kind dependency waiting on upstream`
         args = argparse.Namespace(task_id=child, ids=None, reason=["waiting", "on", "upstream"], kind="dependency")
-        assert kanban_cli._cmd_block(args) == 0
+        with worker_surface(child):
+            assert kanban_cli._cmd_block(args) == 0
         assert f"Blocked {child} as needs_input (no open parent to wait on): waiting on upstream" in capsys.readouterr().out
         parked = kb.get_task(conn, child)
         assert (parked.status, parked.block_kind, parked.block_recurrences) == ("blocked", "needs_input", 1)
@@ -141,10 +160,13 @@ def test_dependency_block_with_terminal_parents_parks_then_escalates(
         assert kb.recompute_ready(conn) == 0
         assert kb.get_task(conn, child).status == "blocked"
 
-        # A cron/human unblocks; the worker re-declares the same impossible wait.
+        # A cron/human unblocks; the worker re-declares the same impossible wait
+        # (same reason text: a changed reason is a NEW cause under the
+        # park-vs-loop guard and would reset the counter instead).
         assert kb.unblock_task(conn, child)
         assert kb.claim_task(conn, child, claimer="worker") is not None
-        assert kb.block_task(conn, child, reason="still waiting", kind="dependency")
+        with worker_surface(child):
+            assert kb.block_task(conn, child, reason="waiting on upstream", kind="dependency")
         assert kb.get_task(conn, child).status == "triage"
         loop = [e for e in kb.list_events(conn, child) if e.kind == "block_loop_detected"][-1].payload
         assert loop["recurrences"] == kb.BLOCK_RECURRENCE_LIMIT

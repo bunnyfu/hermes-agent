@@ -1001,6 +1001,11 @@ def _cmd_block(args: argparse.Namespace) -> int:
             if kind == "dependency" and where == "blocked":
                 return f"Blocked {tid} as needs_input (no open parent to wait on){suffix}"
             if where == "triage":
+                # An idempotent re-assert (already-typed triage card) is a park
+                # refresh, not a loop detection — report it as one.
+                ev = [e for e in kb.list_events(conn, tid) if e.kind == "blocked"]
+                if ev and (ev[-1].payload or {}).get("reassert"):
+                    return f"{tid} → triage (park re-asserted){suffix}"
                 # Only a typed owner-input block carries a question for a human.
                 verdict = ("needs a human decision" if (landed.block_kind if landed else kind) == "needs_input"
                            else "orchestration attention needed")

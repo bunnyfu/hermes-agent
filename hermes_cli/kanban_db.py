@@ -106,8 +106,12 @@ VALID_INITIAL_STATUSES = {"running", "blocked"}
 # Typed block reasons (routing in ``_route_block``); ``None`` = legacy un-typed.
 VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 
-# Same-reason block -> unblock -> re-block cycles before routing to ``triage``.
-# Counts unblock recurrences, NOT dispatcher failures (``DEFAULT_FAILURE_LIMIT``).
+# Same-kind re-block -> unblock -> re-block cycles before routing to ``triage``.
+# Counts WORKER-surface re-block recurrences only (the dispatcher claim-loop the
+# breaker models); non-worker (interactive/supervisor) ``needs_input`` blocks are
+# exempt entirely, and a changed block reason or a supervisor E3 marker comment
+# newer than the last block event resets the count. NOT dispatcher spawn
+# failures (``DEFAULT_FAILURE_LIMIT``).
 BLOCK_RECURRENCE_LIMIT = 2
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 
@@ -3205,6 +3209,68 @@ def edit_task(
     return True
 
 
+# Blocker surface recorded on every blocked/block_loop_detected event payload:
+# ``worker`` = a dispatcher-spawned run blocking its own card (the surface the
+# unblock-loop breaker models); anything else (interactive CLI, supervisor,
+# dashboard) is non-worker. Unknown/absent context conservatively reads as a
+# worker block so legacy call sites keep the old trip behavior.
+WORKER_BLOCK_SURFACE = "worker"
+NON_WORKER_BLOCK_SURFACE = "non-worker"
+
+
+def _blocker_surface() -> str:
+    """Best-effort surface tag for a block about to be recorded."""
+    if os.environ.get("HERMES_KANBAN_TASK"):
+        return WORKER_BLOCK_SURFACE
+    return NON_WORKER_BLOCK_SURFACE
+
+
+# Supervisor E3 park comments carry this marker (fleet convention: the memo is
+# mandatory on every E3 park). A comment bearing it that is NEWER than the last
+# block event proves a supervisor deliberately re-parked after the loop history
+# — the recurrence counter must not treat the next park as a continuation.
+E3_MEMO_MARKER = "[E3 memo]"
+
+
+def _supervisor_marker_postdates_last_block(conn: sqlite3.Connection, task_id: str) -> bool:
+    """True when a marker-bearing nexus/supervisor comment is newer than the
+    task's last block/loop event (reset trigger (a2))."""
+    last_block = conn.execute(
+        "SELECT MAX(created_at) FROM task_events "
+        "WHERE task_id = ? AND kind IN ('blocked', 'block_loop_detected')",
+        (task_id,),
+    ).fetchone()
+    last_block_at = last_block[0] if last_block else None
+    if last_block_at is None:
+        return False
+    marker_pattern = f"%{E3_MEMO_MARKER.replace(chr(92), chr(92) * 2).replace('%', chr(92) + '%')}%"
+    marker_row = conn.execute(
+        "SELECT COUNT(*) FROM task_comments "
+        "WHERE task_id = ? AND author IN ('nexus', 'supervisor') "
+        "AND body LIKE ? ESCAPE '\\' AND created_at > ?",
+        (task_id, marker_pattern, int(last_block_at)),
+    ).fetchone()
+    return bool(marker_row and marker_row[0])
+
+
+def _last_block_reason(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    """Reason text of the task's most recent block event (reset trigger (a1))."""
+    row = conn.execute(
+        "SELECT payload FROM task_events "
+        "WHERE task_id = ? AND kind IN ('blocked', 'block_loop_detected') "
+        "ORDER BY created_at DESC, id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if not row or not row[0]:
+        return None
+    try:
+        payload = json.loads(row[0])
+    except (TypeError, ValueError):
+        return None
+    reason = payload.get("reason") if isinstance(payload, dict) else None
+    return reason if isinstance(reason, str) else None
+
+
 def block_task(
     conn: sqlite3.Connection, task_id: str, *, reason: Optional[str] = None,
     kind: Optional[str] = None, expected_run_id: Optional[int] = None,
@@ -3222,6 +3288,10 @@ def block_task(
     audit event is appended, while status, failure evidence and the terminal
     runs stay exactly as the breaker left them. A typed block, a card with a
     live run, or a kind-less call on a blocked card are still refused.
+
+    A ``triage`` card whose ``block_kind`` already equals *kind* re-asserts the
+    park idempotently (timestamp refreshed, counter kept) instead of
+    hard-erroring — a supervisor re-park is never refused.
     """
     if kind is not None and kind not in VALID_BLOCK_KINDS:
         raise ValueError(f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None")
@@ -3231,6 +3301,9 @@ def block_task(
         ).fetchone()
         if cur_row is None:
             return False
+        if cur_row["status"] == "triage" and _row_get(cur_row, "block_kind") == kind:
+            # Direction (c): idempotent re-park of an already-typed triage card.
+            return _reassert_triage_park(conn, task_id, kind, reason)
         # The breaker (``_record_task_failure``) parks cards ``blocked`` with no
         # ``block_kind`` and no ``blocked`` event -- the policy is the
         # supervisor's, not the kernel's -- but the transition guard below only
@@ -3264,7 +3337,8 @@ def block_task(
             kind = "needs_input"
             rekind_reason = "no_open_parent"
         new_status, event_kind, set_sql, params, payload = _route_block(
-            kind, reason, source_status, prev_kind=_row_get(cur_row, "block_kind"),
+            conn, kind, reason, source_status, task_id=task_id,
+            prev_kind=_row_get(cur_row, "block_kind"),
             prev_recurrences=int(_row_get(cur_row, "block_recurrences") or 0),
         )
         if rekind_reason:
@@ -3299,9 +3373,35 @@ def block_task(
     return True
 
 
+def _reassert_triage_park(
+    conn: sqlite3.Connection, task_id: str, kind: Optional[str], reason: Optional[str],
+) -> bool:
+    """Idempotently re-assert an existing triage park (direction (c)).
+
+    The card already sits in ``triage`` with this ``block_kind``: re-block is
+    a no-op state-wise, so just touch the park timestamp and record the
+    re-assertion. The recurrence counter is deliberately NOT incremented —
+    the breaker counts unblock->re-block cycles, and a triaged card was never
+    unblocked. Legacy rows (pre-fix) that arrived here with a stale nonzero
+    counter get it clamped to a safe value on the way through.
+    """
+    conn.execute("UPDATE tasks SET block_recurrences = 0 WHERE id = ?", (task_id,))
+    run_id = _end_or_synthesize_run(
+        conn, task_id, outcome="blocked", status="triage", summary=reason, synthesize=bool(reason),
+    )
+    _append_event(
+        conn, task_id, "blocked",
+        {"reason": reason, "kind": kind, "recurrences": 0, "source_status": "triage",
+         "reassert": True, "surface": _blocker_surface()},
+        run_id=run_id,
+    )
+    _fire_task_hook("kanban_task_blocked", get_task(conn, task_id), task_id, run_id, reason=reason)
+    return True
+
+
 def _route_block(
-    kind: Optional[str], reason: Optional[str], source_status: str, *,
-    prev_kind: Optional[str], prev_recurrences: int,
+    conn: sqlite3.Connection, kind: Optional[str], reason: Optional[str], source_status: str, *,
+    task_id: str, prev_kind: Optional[str], prev_recurrences: int,
 ) -> tuple[str, str, str, tuple, dict]:
     """``(new_status, event_kind, set_sql, params, payload)`` for :func:`block_task`.
 
@@ -3309,19 +3409,37 @@ def _route_block(
     ``todo`` for ``recompute_ready``, so a cron never sees a dependency-wait
     as something to "unblock". Callers that pass ``dependency`` with no
     incomplete parent are re-kinded to ``needs_input`` before this runs
-    (see :func:`block_task`). Every other kind counts unblock-loop
-    recurrences: block_task only fires from running/ready (AFTER an unblock
-    returned the task to the pool), so a stored ``block_kind`` equal to the
-    incoming one means blocked -> unblocked -> re-block for the same cause
-    (un-typed None compares equal to a prior un-typed block). At
-    ``BLOCK_RECURRENCE_LIMIT`` the task routes to ``triage`` for a human.
+    (see :func:`block_task`). For every other kind the breaker counts
+    WORKER-surface re-blocks only, with two reset triggers: a CHANGED block
+    reason (the same worker hitting a genuinely new blocker is a new problem,
+    not a loop) and a marker-bearing supervisor/nexus comment newer than the
+    last block event (a supervisor E3 re-park is a deliberate park, not a
+    loop). Non-worker ``needs_input`` blocks never enter the counter at all.
+    At ``BLOCK_RECURRENCE_LIMIT`` the task routes to ``triage`` for a human.
     """
-    payload = {"reason": reason, "kind": kind, "source_status": source_status}
+    surface = _blocker_surface()
+    payload = {"reason": reason, "kind": kind, "source_status": source_status, "surface": surface}
     if kind == "dependency":
         return "todo", "dependency_wait", "block_kind    = ?", (kind,), payload
     recurrences = prev_recurrences + 1 if prev_kind == kind else 1
+    # Reset trigger (a1): the reason text changed -> a new cause, not a loop.
+    if recurrences > 1 and prev_kind == kind and reason is not None:
+        if _last_block_reason(conn, task_id) != reason:
+            recurrences = 1
+    # Reset trigger (a2): a supervisor E3 marker comment landed after the last
+    # block event -> the history is a completed supervision episode.
+    if recurrences > 1 and _supervisor_marker_postdates_last_block(conn, task_id):
+        recurrences = 1
+    # Direction (b): non-worker needs_input blocks are exempt from the counter
+    # entirely — they are supervisor/human decisions, not dispatcher claim-loops.
+    exempt = kind == "needs_input" and surface != WORKER_BLOCK_SURFACE
+    if exempt:
+        recurrences = 0
     set_sql = "block_kind    = ?,\n                       block_recurrences = ?"
-    payload = {"reason": reason, "kind": kind, "recurrences": recurrences, "source_status": source_status}
+    payload = {
+        "reason": reason, "kind": kind, "recurrences": recurrences,
+        "source_status": source_status, "surface": surface,
+    }
     if recurrences >= BLOCK_RECURRENCE_LIMIT:
         payload["limit"] = BLOCK_RECURRENCE_LIMIT
         return "triage", "block_loop_detected", set_sql, (kind, recurrences), payload
