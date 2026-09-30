@@ -303,7 +303,35 @@ def test_expected_sha256_malformed_clean_error(worker_env, bad_sha):
 
 
 # ---------------------------------------------------------------------------
-# 5. Per-board DB shapes: the options-worker shape (no column at all)
+# 5. Contract boundary (documented): undeclared corrupt attaches
+# ---------------------------------------------------------------------------
+
+def test_undeclared_corrupt_attach_still_records_digest_for_audit(worker_env):
+    """Without a declaration there is nothing server-side to check the
+    payload against (the guard is contract-based; it never parses the
+    payload's self-describing header), so the attach lands — but the row
+    records the payload's TRUE digest (junk's c1c0de08…, not the clean
+    7a9fb2a2…), so post-hoc audits can detect the corruption. On main @
+    99721dca80 this leg FAILS: the row carried no digest at all (and on
+    the options-worker shape, no column even existed)."""
+    from hermes_cli import kanban_db as kb
+
+    d = _attach(worker_env, "deploy_t_a45e7dcd.log", JUNK_B64)
+    assert d.get("ok") is True, d
+    assert d["size"] == JUNK_SIZE
+    assert d["sha256"] == JUNK_SHA256
+    conn = kb.connect()
+    try:
+        rows = _all_rows(conn, worker_env)
+        assert len(rows) == 1
+        assert rows[0]["sha256"] == JUNK_SHA256
+        assert rows[0]["size"] == JUNK_SIZE
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# 6. Per-board DB shapes: the options-worker shape (no column at all)
 # ---------------------------------------------------------------------------
 
 def test_board_without_sha256_column_migrates_and_records(tmp_path, monkeypatch):
