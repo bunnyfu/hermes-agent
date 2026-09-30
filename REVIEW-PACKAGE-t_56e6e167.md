@@ -50,10 +50,26 @@ guard exists for, caught by the same discipline.
   the sha256 column entirely) — column added on connect, digest recorded,
   guard fires: green on branch, fails on bases (mechanism absent there).
 - FULL SUITE (card step 4): tests/tools + tests/hermes_cli + tests/plugins
-  (the touched packages), ~25.7k tests. Three PRE-EXISTING collection errors
-  (fal_client / telegram deps missing in the local env — identical on
-  pristine main, excluded by base-parity). Result recorded in the completion
-  report; claim backed by the run log, not asserted.
+  (~25.7k tests). Finding first: a SINGLE pytest process over the combined
+  packages SEGFAULTS mid-run on BOTH trees (pristine main at 54%, branch at
+  58%) — native crash in plugin-loader background imports
+  (plugins/platforms/raft → pathlib resolve under tests/home_io_guard);
+  host/interpreter-level instability (anaconda py3.12), unrelated to this
+  delta and present on pristine main. Verdict therefore from CHUNKED
+  per-package runs (4/2/1 chunks, per-chunk pytest processes): 0 chunk
+  crashes on either tree; branch 1145 vs base 1108 failed ids under
+  deliberately DUAL CONCURRENT load. Adjudication (pitfall: combined-run
+  failures are not auto-regressions): all 44 branch-only failures PASS
+  isolated on the branch (44/44 in 62s — contention flakes); of the 7
+  base-only failures, 6 pass isolated on base and 1 is a timing flake that
+  passes on rerun on BOTH trees; 2 kanban-named failures persist isolated
+  but fail IDENTICALLY on pristine main (pre-existing local-env: spawn
+  guard + board-pin env on this host). Net regressions attributable to the
+  branch: ZERO. No kanban/attach-surface test fails on the branch beyond
+  what pristine main fails. Three collection errors are pre-existing env
+  misses (fal_client/telegram deps absent locally), identical on both trees.
+- tests/tools/test_attach_declared_size.py: 17/17 on the branch; teeth
+  matrix above.
 
 ## Known weaknesses (disclosed)
 
