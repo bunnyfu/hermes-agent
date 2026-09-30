@@ -970,6 +970,16 @@ def _handle_attach(args: dict, **kw) -> str:
     result echoes so the caller can verify byte-identity. For on-disk
     files prefer :func:`_handle_attach_file` (the model never touches the
     bytes) or ``kanban_complete(artifacts=[...])``.
+
+    Declared-content guard (t_56e6e167, the t_a45e7dcd attachment-38
+    incident class): when the caller declares ``expected_size`` (byte
+    count observed before encoding) and/or ``expected_sha256`` (digest of
+    the source), the stored payload must match the declaration exactly or
+    the attach is refused with nothing recorded. This catches the family
+    where the model emits self-consistent-looking base64 whose payload is
+    junk (380 B of filler whose own header text claims 'Real Content
+    Size : 57226 Bytes' — the payload's self-description is never used;
+    only the caller's independently observed declaration counts).
     """
     tid = _worker_guard("kanban_attach", args)
     filename = _require_text(args, "filename")
@@ -989,11 +999,45 @@ def _handle_attach(args: dict, **kw) -> str:
             "prefer kanban_attach_file with the source path, or "
             "kanban_complete(artifacts=[...]) for on-disk deliverables."
         )
+    expected_size = args.get("expected_size")
+    if expected_size is not None:
+        try:
+            expected_size = int(expected_size)
+        except (TypeError, ValueError):
+            return tool_error(
+                "kanban_attach: expected_size must be an integer byte count, "
+                f"got {expected_size!r}"
+            )
+        if expected_size < 0:
+            return tool_error("kanban_attach: expected_size must be >= 0")
+    expected_sha256 = args.get("expected_sha256")
+    if expected_sha256 is not None:
+        expected_sha256 = str(expected_sha256).strip().lower()
+        if len(expected_sha256) != 64 or any(
+            c not in "0123456789abcdef" for c in expected_sha256
+        ):
+            return tool_error(
+                "kanban_attach: expected_sha256 must be a 64-char lowercase "
+                "hex sha256 digest"
+            )
     board = args.get("board")
     with _board(board) as (kb, conn):
-        att_id = kb.store_attachment_bytes(
-            conn, tid, str(filename), data,
-            content_type=args.get("content_type"), uploaded_by="agent", board=board)
+        try:
+            att_id = kb.store_attachment_bytes(
+                conn, tid, str(filename), data,
+                content_type=args.get("content_type"), uploaded_by="agent", board=board,
+                expected_size=expected_size,
+                expected_sha256=expected_sha256,
+            )
+        except kb.AttachmentIntegrityError as e:
+            return tool_error(
+                f"kanban_attach integrity guard: {e} — the payload does not "
+                "match what you declared. The base64 you emitted is corrupt "
+                "or fabricated: re-encode the source mechanically (base64 of "
+                "its full bytes), or use kanban_attach_file with the source "
+                "path, and declare expected_size/expected_sha256 from values "
+                "you observed before encoding."
+            )
         return _ok(
             task_id=tid,
             attachment_id=att_id,

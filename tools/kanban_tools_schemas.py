@@ -327,6 +327,19 @@ KANBAN_ATTACH_SCHEMA = _schema(
             "type": "string",
             "description": "The file contents, base64-encoded. Max 25 MB decoded.",
         },
+        "expected_size": _prop("integer", (
+                "Declared size of the content in bytes (the exact size you "
+                "observed on disk or in memory before encoding). The server "
+                "refuses the attach when the decoded payload's byte count "
+                "differs — the fail-loud guard for fabricated or truncated "
+                "model-emitted args. Declare it whenever the true size is "
+                "known; never copy it from the payload's own header text."
+        )),
+        "expected_sha256": _prop("string", (
+                "Optional declared sha256 hex digest of the content (lowercase, "
+                "64 chars, as computed from the source before encoding). The "
+                "server refuses the attach on mismatch."
+        )),
         "content_type": _prop("string", "Optional MIME type (e.g. 'application/pdf')."),
     },
     ["filename", "content_base64"],
