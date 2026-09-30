@@ -911,6 +911,17 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     # Same ordering rule as the ``tasks`` indexes above: index after column.
     conn.execute("CREATE INDEX IF NOT EXISTS idx_events_run ON task_events(run_id, id)")
 
+    # task_attachments gained a sha256 column after the 2026-09-05 attach
+    # corruption incident (t_2ae14d55): every stored blob now records its
+    # digest so verifiers can compare the on-disk file against the row.
+    # NULL for historical rows (their bytes were never hashed at attach
+    # time). Legacy boards that created task_attachments before this column
+    # must get it additively — SCHEMA_SQL only covers fresh DBs.
+    if _table_exists(conn, "task_attachments"):
+        att_cols = _column_names(conn, "task_attachments")
+        if "sha256" not in att_cols:
+            _add_column_if_missing(conn, "task_attachments", "sha256", "sha256 TEXT")
+
     if _table_exists(conn, "kanban_notify_subs"):
         notify_cols = _column_names(conn, "kanban_notify_subs")
         for name, ddl in _NOTIFY_SUB_COLUMNS:
