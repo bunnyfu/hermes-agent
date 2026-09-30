@@ -10,8 +10,8 @@ guard + real-incident regression suite.
 |---|---|
 | 99721dca80 | main base (Sep 30) |
 | 3d9f72717c | merge 39c734edaa (fleet-pin/attach-replay-t96) — sha256 column+migration, store_attachment_bytes guard+byte-identity self-check, kanban_attach_file, sha256 echo, completion-stager hashing, dashboard digest. One conflict (test imports, union-resolved). Zero production conflicts. |
-| 2bda5c009b | delta: declared expected_size/expected_sha256 on inline kanban_attach (schema + handler + docs), connect/connect_closing re-export drift repair, tests/tools/test_attach_declared_size.py (18 tests) |
-| (this commit) | contract-boundary leg + this ops record |
+| 2bda5c009b | delta: declared expected_size/expected_sha256 on inline kanban_attach (schema + handler + docs), connect/connect_closing re-export drift repair, tests/tools/test_attach_declared_size.py |
+| b0619e7fc2 | contract-boundary leg (undeclared corrupt attach stores but records the true digest) + this ops record |
 
 ## Incident binding
 
@@ -27,25 +27,25 @@ guard exists for, caught by the same discipline.
 
 ## Battery receipts
 
-- POSITIVE (branch tip): tests/tools/test_attach_declared_size.py → 18 passed;
-  tests/tools/test_attach_integrity.py (replay fix's own suite) → 19 passed
-  (with the new file: 37 passed in one run).
-- TEETH (negative controls) — the new test file run against pre-delta trees in
+- POSITIVE (branch tip): tests/tools/test_attach_declared_size.py → **17 passed**;
+  together with the replay fix's own suite tests/tools/test_attach_integrity.py
+  → 37 passed in one run (pre-delta-split file set).
+- TEETH (negative controls) — the FINAL test file run against pre-delta trees in
   detached throwaway worktrees (/private/tmp/t56-base-merge @ 3d9f72717c,
   /private/tmp/t56-base-main @ 99721dca80; copies patched ONLY in the two
   kb.connect() helper sites to route through kanban_db_connect.connect, which
   is what those trees used — the re-export under test is delta work):
-  - merge-base: 7 failed / 11 passed — all three incident legs FAIL
-    ("unknown parameter(s): expected_size" — the knobs did not exist; the
-    undeclared incident call lands silently); honest+board-shape+digest legs
-    FAIL; malformed-declaration legs PASS vacuously (strict arg validation
-    already rejected unknown params post-replay).
-  - pristine main: 10 failed / 2 passed — additionally the malformed
-    declaration legs FAIL on REAL teeth (old handler had no arg validation:
-    bogus expected_size ignored, junk stored ok:true) and the
+  - merge-base 3d9f72717c: **7 failed, 10 passed** — all three incident legs
+    FAIL ("unknown parameter(s): expected_size" — the knobs did not exist; the
+    undeclared incident call lands silently), honest/boundary/digest/board-shape
+    legs FAIL. Passing: the 2 constants-only fixture legs + the malformed-
+    declaration legs (post-replay strict arg validation already rejected
+    unknown params — vacuous teeth THERE, real on main, see next).
+  - pristine main 99721dca80: **15 failed, 2 passed** — only the two
+    constants-only fixture legs survive. Additionally vs merge-base: the
+    malformed-declaration legs FAIL on REAL teeth (old handler had no arg
+    validation: bogus expected_size ignored, junk stored ok:true) and the
     undeclared-corrupt-digest leg FAILS (row carried no sha256 at all).
-  - Fixture-integrity legs (the only 2) PASS on all trees — they test
-    constants, not code, by design.
 - MIGRATION: options-worker-shape leg (board DB with task_attachments lacking
   the sha256 column entirely) — column added on connect, digest recorded,
   guard fires: green on branch, fails on bases (mechanism absent there).
@@ -80,5 +80,7 @@ guard exists for, caught by the same discipline.
 cd /Users/ikavt/Developer/worktrees/hermes-agent/wt-t56e6e167
 python3 -m pytest tests/tools/test_attach_declared_size.py tests/tools/test_attach_integrity.py -q
 # expect: 37 passed
-git log --oneline main..HEAD           # 3d9f72717c, 2bda5c009b, +ops record
+python3 -m pytest tests/tools/test_attach_declared_size.py -q
+# expect: 17 passed
+git log --oneline main..HEAD           # b0619e7fc2, 2bda5c009b, 3d9f72717c
 git ls-remote --heads fork wt/attach-guard-t56e6e167   # tip == local HEAD

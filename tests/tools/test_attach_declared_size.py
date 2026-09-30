@@ -289,7 +289,7 @@ def test_expected_size_malformed_clean_error(worker_env, bad_size):
     _assert_nothing_stored(worker_env)
 
 
-@pytest.mark.parametrize("bad_sha", ["zz" * 32, "abc", "A" * 64, ""])
+@pytest.mark.parametrize("bad_sha", ["zz" * 32, "abc", ""])
 def test_expected_sha256_malformed_clean_error(worker_env, bad_sha):
     d = _attach(
         worker_env,
@@ -299,6 +299,22 @@ def test_expected_sha256_malformed_clean_error(worker_env, bad_sha):
     )
     assert "error" in d, d
     assert "expected_sha256" in d["error"], d
+    _assert_nothing_stored(worker_env)
+
+
+def test_expected_sha256_uppercase_normalized_still_enforced(worker_env):
+    """Uppercase hex is case-normalized, not rejected — the declaration is
+    still enforced: 'A'*64 lowercases to a valid digest that cannot match
+    the payload, so the attach is refused by the mismatch guard with
+    nothing stored."""
+    d = _attach(
+        worker_env,
+        "f.txt",
+        base64.b64encode(b"payload").decode(),
+        expected_sha256="A" * 64,
+    )
+    assert "error" in d, d
+    assert "integrity" in d["error"].lower(), d
     _assert_nothing_stored(worker_env)
 
 
