@@ -1219,9 +1219,14 @@ def subscribe_home(task_id: str, platform: str, board: Optional[str] = Query(Non
         f"gateway.platforms.{platform}.home_channel in config.yaml.")
     with _board_conn(board) as (board, conn):
         _require_task(conn, task_id)
-        kbn.add_notify_sub(
-            conn, task_id=task_id, platform=platform, chat_id=home["chat_id"],
-            thread_id=home["thread_id"] or None, notifier_profile=_active_profile_name())
+        try:
+            kbn.add_notify_sub(
+                conn, task_id=task_id, platform=platform, chat_id=home["chat_id"],
+                thread_id=home["thread_id"] or None, notifier_profile=_active_profile_name())
+        except ValueError as exc:
+            # Undeliverable chat_id (e.g. homeserver-less matrix id in the
+            # home_channel config): loud 400 instead of a wake-blind sub row.
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         return {"ok": True, "task_id": task_id, "home_channel": home}
 
 

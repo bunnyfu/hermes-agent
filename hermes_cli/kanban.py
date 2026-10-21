@@ -1161,19 +1161,38 @@ def _cmd_notify_subscribe(args: argparse.Namespace) -> int:
         )
         if value
     }
-    with kbc.connect_closing() as conn:
-        if kb.get_task(conn, args.task_id) is None:
-            return _err(f"no such task: {args.task_id}")
-        kbn.add_notify_sub(
-            conn, task_id=args.task_id, platform=args.platform, chat_id=args.chat_id,
-            chat_type=args.chat_type, thread_id=args.thread_id, user_id=args.user_id,
-            user_id_alt=getattr(args, "user_id_alt", None),
-            notifier_profile=args.notifier_profile or _profile_author(),
-            delivery_mode=getattr(args, "delivery_mode", None),
-            delivery_metadata=delivery_metadata or None,
-        )
+    try:
+        with kbc.connect_closing() as conn:
+            if kb.get_task(conn, args.task_id) is None:
+                return _err(f"no such task: {args.task_id}")
+            kbn.add_notify_sub(
+                conn, task_id=args.task_id, platform=args.platform, chat_id=args.chat_id,
+                chat_type=args.chat_type, thread_id=args.thread_id, user_id=args.user_id,
+                user_id_alt=getattr(args, "user_id_alt", None),
+                notifier_profile=args.notifier_profile or _profile_author(),
+                delivery_mode=getattr(args, "delivery_mode", None),
+                delivery_metadata=delivery_metadata or None,
+            )
+            # Arm-time readback: assert the STORED row is deliverable-shaped,
+            # not merely present. A bare matrix id used to persist as a
+            # success-shaped row that could never receive a send.
+            row = kbn.get_notify_sub(
+                conn, task_id=args.task_id, platform=args.platform, chat_id=args.chat_id,
+                thread_id=args.thread_id,
+            )
+    except ValueError as exc:
+        # Invalid subscription target (e.g. homeserver-less matrix id): the
+        # kernel guarantees nothing was written; rc 2 = usage/validation error.
+        return _err(f"cannot subscribe: {exc}", rc=2)
+    if row is None:
+        return _err(f"readback failed: no subscription row for "
+                    f"{args.platform}:{args.chat_id} after subscribe", rc=3)
+    try:
+        kbn.validate_notify_chat_id(row["platform"], row["chat_id"])
+    except ValueError as exc:
+        return _err(f"readback dirty: {exc}", rc=3)
     print(f"Subscribed {args.platform}:{args.chat_id}" + (f":{args.thread_id}" if args.thread_id else "")
-          + f" to {args.task_id}")
+          + f" to {args.task_id} (readback ok: stored {args.platform}:{row['chat_id']})")
     return 0
 
 
@@ -1194,7 +1213,13 @@ def _cmd_notify_list(args: argparse.Namespace) -> int:
             f"  user_id_alt={s['user_id_alt']}" if s.get("user_id_alt") else "",
             "" if dmode == "notify" else f"  mode={dmode}",
         ))
-        print(f"  {s['task_id']:10s}  {s['platform']}:{s['chat_id']}{thr}  (since event {s['last_event_id']}){extras}")
+        # Legacy rows written before chat_id validation can be homeserver-less
+        # matrix ids: undeliverable (every send fails "not in room") while the
+        # row itself reads back green. Surface them at the readback surface.
+        suspect = (str(s.get("platform") or "").lower() == "matrix"
+                   and ":" not in str(s.get("chat_id") or ""))
+        warn = "  [WAKE-BLIND: matrix chat_id missing ':homeserver' — resubscribe with the full form]" if suspect else ""
+        print(f"  {s['task_id']:10s}  {s['platform']}:{s['chat_id']}{thr}  (since event {s['last_event_id']}){extras}{warn}")
     return 0
 
 

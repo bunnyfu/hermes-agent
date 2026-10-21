@@ -8,6 +8,7 @@ late-bound via ``_kb`` (import-cycle breaking) so monkeypatching
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import time
 from pathlib import Path
@@ -24,6 +25,34 @@ if TYPE_CHECKING:
 # Notifier reaction to a terminal event: "notify" = passive adapter.send only
 # (default); "notify+wake" = send AND wake the destination agent; "wake" = wake only.
 _NOTIFY_DELIVERY_MODES = ("notify", "notify+wake", "wake")
+
+# Matrix ids address a room/user only WITH their homeserver suffix
+# ("!room:homeserver", "@user:homeserver", "#alias:homeserver"). A suffix-less
+# ("bare") id matches no joined room: the adapter resolves it verbatim, every
+# send fails server-side ("not in room ..."), and the sub row still reads back
+# green — a wake-blind subscription (the cursor settles while delivery fails).
+# Localpart charset mirrors the upstream matrix room-id grammar's common forms;
+# the load-bearing part is the single ':' separator with both sides non-empty.
+_MATRIX_CHAT_ID_RE = re.compile(r"^[@!#][-A-Za-z0-9._=/+]+:[^:\s]+$")
+
+
+def validate_notify_chat_id(platform: str, chat_id: str) -> None:
+    """Reject ``chat_id`` values that can never be delivered on ``platform``.
+
+    Raises :class:`ValueError` (nothing is written) for an empty/whitespace
+    chat_id on any platform, and for a homeserver-less matrix id. Kept public
+    so arm-time callers (CLI readback, guards) assert the stored row with the
+    same rule the write path enforces.
+    """
+    if not isinstance(chat_id, str) or not chat_id.strip():
+        raise ValueError("chat_id must be a non-empty string")
+    if str(platform or "").strip().lower() == "matrix" and not _MATRIX_CHAT_ID_RE.match(chat_id):
+        raise ValueError(
+            f"matrix chat_id {chat_id!r} is missing its homeserver suffix and would be "
+            "wake-blind (every send fails 'not in room'); use the full form "
+            "'!room:homeserver' or '@user:homeserver'"
+        )
+
 
 _SCALAR_TYPES = (str, int, float, bool)
 
@@ -90,7 +119,15 @@ def add_notify_sub(
     into an existing row so re-subscribing never discards them. New subs start
     caught up (``last_event_id`` =
     ``MAX(task_events.id)``) so the notifier never replays history at boot.
+
+    Raises :class:`ValueError` — before anything is written — when ``chat_id``
+    is empty or, on ``matrix``, homeserver-less (see
+    :func:`validate_notify_chat_id`): such a row reads back green while every
+    delivery fails, i.e. a wake-blind subscription. A readback inside the same
+    transaction re-asserts the STORED row so a future write-path regression
+    fails closed instead of persisting an undeliverable row.
     """
+    validate_notify_chat_id(platform, chat_id)
     valid_mode = delivery_mode if delivery_mode in _NOTIFY_DELIVERY_MODES else None
     # api_server is stateless: the adapter has no send(), the wake self-post IS
     # the delivery. A plain 'notify' default would leave those subs with no
@@ -139,6 +176,16 @@ def add_notify_sub(
                 f"UPDATE kanban_notify_subs SET {column} = ? " + _SUB_KEY_WHERE + guard,
                 (value, *key),
             )
+        # Arm-time readback: the STORED row must be deliverable-shaped, not
+        # merely present. Raises inside the write transaction, so a dirty row
+        # rolls back instead of persisting (fail closed, nothing written).
+        stored = conn.execute(
+            "SELECT platform, chat_id FROM kanban_notify_subs " + _SUB_KEY_WHERE,
+            key,
+        ).fetchone()
+        if stored is None:
+            raise RuntimeError("kanban_notify_subs row missing immediately after add_notify_sub")
+        validate_notify_chat_id(stored["platform"], stored["chat_id"])
 
 
 def _notify_profile_filter(
@@ -197,6 +244,29 @@ def list_notify_subs(
             item["delivery_metadata"] = _decode_notify_delivery_metadata(item.get("delivery_metadata"))
         out.append(item)
     return out
+
+
+def get_notify_sub(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str] = None,
+) -> Optional[dict]:
+    """One subscription row (decoded), or ``None`` — the arm-time readback
+    primitive. Callers verify the row's *shape* (e.g.
+    :func:`validate_notify_chat_id`), not mere presence, before trusting a sub."""
+    row = conn.execute(
+        "SELECT * FROM kanban_notify_subs " + _SUB_KEY_WHERE,
+        _sub_key(task_id, platform, chat_id, thread_id),
+    ).fetchone()
+    if row is None:
+        return None
+    item = dict(row)
+    if "delivery_metadata" in item:
+        item["delivery_metadata"] = _decode_notify_delivery_metadata(item.get("delivery_metadata"))
+    return item
 
 
 def count_notify_subs(

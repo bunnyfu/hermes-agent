@@ -1178,3 +1178,244 @@ def test_gc_purges_blocked_task_that_never_done(kanban_home):
         assert kbn.list_notify_subs(conn, tid) == []
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# chat_id validation: homeserver-less matrix ids must never persist (t_8c99a0a6)
+# ---------------------------------------------------------------------------
+
+def _sub_count(conn, tid):
+    return len(kbn.list_notify_subs(conn, tid))
+
+def test_add_notify_sub_rejects_bare_matrix_chat_ids(kanban_home):
+    """A homeserver-less matrix room/user id reads back green but can never
+    receive a send (every delivery fails 'not in room'): the write path must
+    reject it BEFORE anything is written (t_8c99a0a6)."""
+    import hermes_cli.kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from hermes_cli import kanban_db_notify as kbn
+
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="bare matrix sub", assignee="worker1")
+        for bare in ("!cwHvYNwbuZDBHcilDs", "@operator", "#dev-room"):
+            with pytest.raises(ValueError, match="homeserver"):
+                kbn.add_notify_sub(
+                    conn, task_id=tid, platform="matrix", chat_id=bare,
+                    chat_type="group", notifier_profile="nexus", delivery_mode="wake",
+                )
+        # Nothing was written for any rejected form.
+        assert _sub_count(conn, tid) == 0
+    finally:
+        conn.close()
+
+def test_add_notify_sub_rejects_empty_and_whitespace_chat_ids(kanban_home):
+    """An empty chat_id is undeliverable on every platform."""
+    import hermes_cli.kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from hermes_cli import kanban_db_notify as kbn
+
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="empty chat_id", assignee="worker1")
+        for platform in ("matrix", "telegram", "slack"):
+            for bad in ("", "   "):
+                with pytest.raises(ValueError, match="non-empty"):
+                    kbn.add_notify_sub(conn, task_id=tid, platform=platform, chat_id=bad)
+        assert _sub_count(conn, tid) == 0
+    finally:
+        conn.close()
+
+def test_add_notify_sub_accepts_full_form_matrix_ids(kanban_home):
+    """Full-form matrix ids (room/user/alias with homeserver) persist and stay
+    idempotent; re-subscribing merges as before."""
+    import hermes_cli.kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from hermes_cli import kanban_db_notify as kbn
+
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="full-form matrix sub", assignee="worker1")
+        kbn.add_notify_sub(
+            conn, task_id=tid, platform="matrix", chat_id="!cwHvYNwbuZDBHcilDs:x.ikavt.com",
+            chat_type="group", notifier_profile="nexus", delivery_mode="wake",
+        )
+        subs = kbn.list_notify_subs(conn, tid)
+        assert len(subs) == 1
+        assert subs[0]["chat_id"] == "!cwHvYNwbuZDBHcilDs:x.ikavt.com"
+        assert subs[0]["delivery_mode"] == "wake"
+
+        kbn.add_notify_sub(conn, task_id=tid, platform="matrix", chat_id="@operator:x.ikavt.com")
+        kbn.add_notify_sub(conn, task_id=tid, platform="matrix", chat_id="#dev:server.org")
+        # Idempotent on the exact key: re-adding the room does not duplicate.
+        kbn.add_notify_sub(conn, task_id=tid, platform="matrix", chat_id="!cwHvYNwbuZDBHcilDs:x.ikavt.com")
+        assert _sub_count(conn, tid) == 3
+    finally:
+        conn.close()
+
+def test_add_notify_sub_non_matrix_platforms_unaffected(kanban_home):
+    """Validation is matrix-scoped: telegram/slack/tui/api_server id shapes
+    (numeric ids, session keys without ':') keep working unchanged."""
+    import hermes_cli.kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from hermes_cli import kanban_db_notify as kbn
+
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="non-matrix shapes", assignee="worker1")
+        for platform, chat_id in (
+            ("telegram", "-1001234567890"),
+            ("slack", "C0483ABCDEF"),
+            ("tui", "20261021_130000_ab12cd34"),
+            ("api_server", "sess_9f8e7d6c"),
+            ("Matrix", "!MiXeDcAsEbUtBaRe"),  # platform match is case-insensitive
+        ):
+            if platform.lower() == "matrix":
+                with pytest.raises(ValueError, match="homeserver"):
+                    kbn.add_notify_sub(conn, task_id=tid, platform=platform, chat_id=chat_id)
+            else:
+                kbn.add_notify_sub(conn, task_id=tid, platform=platform, chat_id=chat_id)
+        assert _sub_count(conn, tid) == 4
+    finally:
+        conn.close()
+
+def test_add_notify_sub_readback_asserts_stored_row(kanban_home, monkeypatch):
+    """The in-transaction readback re-asserts the STORED row: if the entry
+    gate were bypassed, the dirty write still rolls back (fail closed) —
+    teeth for the arm-time readback itself."""
+    import hermes_cli.kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from hermes_cli import kanban_db_notify as kbn
+
+    real_validate = kbn.validate_notify_chat_id
+    calls = {"n": 0}
+
+    def entry_bypass_then_real(platform, chat_id):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return  # first call is the entry gate: simulate a legacy/loose gate
+        return real_validate(platform, chat_id)
+
+    monkeypatch.setattr(kbn, "validate_notify_chat_id", entry_bypass_then_real)
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="readback teeth", assignee="worker1")
+        with pytest.raises(ValueError, match="homeserver"):
+            kbn.add_notify_sub(conn, task_id=tid, platform="matrix", chat_id="!bare")
+        # Rolled back: the readback fired INSIDE the write transaction.
+        assert _sub_count(conn, tid) == 0
+        assert calls["n"] == 2  # entry (bypassed) + readback (enforced)
+    finally:
+        monkeypatch.undo()
+        conn.close()
+
+def test_get_notify_sub_returns_decoded_row_or_none(kanban_home):
+    import hermes_cli.kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from hermes_cli import kanban_db_notify as kbn
+
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="readback primitive", assignee="worker1")
+        assert kbn.get_notify_sub(conn, task_id=tid, platform="matrix", chat_id="!x:y.here") is None
+        kbn.add_notify_sub(
+            conn, task_id=tid, platform="matrix", chat_id="!cwHvYNwbuZDBHcilDs:x.ikavt.com",
+            thread_id="$evt123", delivery_metadata={"chat_type": "group", "guild_id": None},
+        )
+        row = kbn.get_notify_sub(
+            conn, task_id=tid, platform="matrix", chat_id="!cwHvYNwbuZDBHcilDs:x.ikavt.com",
+            thread_id="$evt123",
+        )
+        assert row is not None
+        assert row["chat_type"] == "dm"  # default, unchanged by validation
+        assert row["delivery_metadata"] == {"chat_type": "group"}
+    finally:
+        conn.close()
+
+def test_notify_subscribe_cli_rejects_bare_matrix_id(kanban_home, capsys):
+    """CLI: bare matrix id -> rc 2, stderr names the fix, NOTHING stored."""
+    import argparse
+    import hermes_cli.kanban_db as kb
+    from hermes_cli import kanban as kc
+    from hermes_cli import kanban_db_connect as kbc
+
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="cli bare reject", assignee="worker")
+
+    parser = argparse.ArgumentParser()
+    kc.build_parser(parser.add_subparsers(dest="command"))
+    args = parser.parse_args([
+        "kanban", "notify-subscribe", tid, "--platform", "matrix",
+        "--chat-id", "!cwHvYNwbuZDBHcilDs", "--chat-type", "group",
+        "--notifier-profile", "nexus", "--delivery-mode", "wake",
+    ])
+    rc = kc.kanban_command(args)
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "homeserver" in err
+    assert "cannot subscribe" in err
+
+    with kbc.connect() as conn:
+        assert kbn.list_notify_subs(conn, tid) == []
+
+def test_notify_subscribe_cli_full_form_reads_back(kanban_home, capsys):
+    """CLI: full-form id -> rc 0 and the success line carries the verified
+    stored form (arm-time readback is operator-visible)."""
+    import argparse
+    import hermes_cli.kanban_db as kb
+    from hermes_cli import kanban as kc
+    from hermes_cli import kanban_db_connect as kbc
+    from hermes_cli import kanban_db_notify as kbn
+
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="cli full form", assignee="worker")
+
+    parser = argparse.ArgumentParser()
+    kc.build_parser(parser.add_subparsers(dest="command"))
+    args = parser.parse_args([
+        "kanban", "notify-subscribe", tid, "--platform", "matrix",
+        "--chat-id", "!cwHvYNwbuZDBHcilDs:x.ikavt.com", "--chat-type", "group",
+        "--notifier-profile", "nexus", "--delivery-mode", "wake",
+    ])
+    assert kc.kanban_command(args) == 0
+    out = capsys.readouterr().out
+    assert "Subscribed matrix:!cwHvYNwbuZDBHcilDs:x.ikavt.com" in out
+    assert "readback ok" in out
+
+    with kbc.connect() as conn:
+        subs = kbn.list_notify_subs(conn, tid)
+    assert len(subs) == 1
+    assert subs[0]["chat_id"] == "!cwHvYNwbuZDBHcilDs:x.ikavt.com"
+
+def test_notify_list_flags_legacy_bare_matrix_row(kanban_home, capsys):
+    """Rows written by pre-validation kernels (bare matrix ids) are flagged
+    WAKE-BLIND at the readback surface instead of reading back green."""
+    import argparse
+    import hermes_cli.kanban_db as kb
+    from hermes_cli import kanban as kc
+    from hermes_cli import kanban_db_connect as kbc
+    from hermes_cli import kanban_db_notify as kbn
+
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="legacy bare row", assignee="worker")
+        tid_ok = kb.create_task(conn, title="legacy full row", assignee="worker")
+        with kb.write_txn(conn):
+            # Simulate a pre-validation kernel write (verbatim INSERT).
+            conn.execute(
+                "INSERT INTO kanban_notify_subs (task_id, platform, chat_id, thread_id,"
+                " chat_type, notifier_profile, delivery_mode, created_at, last_event_id)"
+                " VALUES (?, 'matrix', '!cwHvYNwbuZDBHcilDs', '', 'group', 'nexus', 'wake', 0, 0)",
+                (tid,),
+            )
+        kbn.add_notify_sub(conn, task_id=tid_ok, platform="matrix", chat_id="!fixed:x.ikavt.com")
+
+    parser = argparse.ArgumentParser()
+    kc.build_parser(parser.add_subparsers(dest="command"))
+    args = parser.parse_args(["kanban", "notify-list"])
+    assert kc.kanban_command(args) == 0
+    out = capsys.readouterr().out
+    assert "WAKE-BLIND" in out
+    bare_line = [ln for ln in out.splitlines() if "!cwHvYNwbuZDBHcilDs " in ln or ln.rstrip().endswith("!cwHvYNwbuZDBHcilDs")]
+    assert bare_line and "WAKE-BLIND" in bare_line[0]
+    full_line = [ln for ln in out.splitlines() if "!fixed:x.ikavt.com" in ln]
+    assert full_line and "WAKE-BLIND" not in full_line[0]
