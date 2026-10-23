@@ -8,6 +8,7 @@ and the assignee-fallback logic.
 from __future__ import annotations
 
 import json as jsonlib
+import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -57,6 +58,24 @@ def _patch_extra_body():
     return patch("agent.auxiliary_client.get_auxiliary_extra_body", return_value={})
 
 
+def _profile_modules():
+    """Distinct module objects through which the decomposer resolves profiles.
+
+    Normally ``hermes_cli.profiles`` is the only one, but
+    ``test_kanban_cli_dispatch_passthrough.isolated_kanban_home`` deletes every
+    ``hermes_cli*`` entry from ``sys.modules`` without restoring it. After that
+    file runs, ``sys.modules["hermes_cli.profiles"]`` is a FRESH object while this
+    module (and the decomposer it imported at collection time) still holds the
+    original — so a string-target ``patch("hermes_cli.profiles...")`` silently
+    patches the wrong object and the real registry leaks into the test.
+    """
+    mods = []
+    for mod in (decomp.profiles_mod, sys.modules.get("hermes_cli.profiles")):
+        if mod is not None and not any(mod is m for m in mods):
+            mods.append(mod)
+    return mods
+
+
 def _patch_list_profiles(names: list[str]):
     """Pretend the named profiles exist. The decomposer uses
     profiles_mod.list_profiles() to build the roster + valid-set, and
@@ -69,11 +88,15 @@ def _patch_list_profiles(names: list[str]):
         )
         for i, n in enumerate(names)
     ]
-    return [
-        patch("hermes_cli.profiles.list_profiles", return_value=fake_profiles),
-        patch("hermes_cli.profiles.profile_exists", side_effect=lambda x: x in names),
-        patch("hermes_cli.profiles.get_active_profile_name", return_value=names[0] if names else "default"),
-    ]
+    patches = []
+    for mod in _profile_modules():
+        patches.extend([
+            patch.object(mod, "list_profiles", return_value=fake_profiles),
+            patch.object(mod, "profile_exists", side_effect=lambda x: x in names),
+            patch.object(mod, "get_active_profile_name",
+                         return_value=names[0] if names else "default"),
+        ])
+    return patches
 
 
 def test_decompose_with_fanout_creates_children(kanban_home):
