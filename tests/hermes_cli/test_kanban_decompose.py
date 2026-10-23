@@ -256,3 +256,205 @@ def test_decompose_returns_false_when_task_not_triage(kanban_home):
     assert outcome.ok is False
 
 
+# ---------------------------------------------------------------------------
+# kanban.fleet_profiles — decompose-path routing allowlist
+# ---------------------------------------------------------------------------
+
+#: Byte-for-byte rendering of the legacy roster block for
+#: ``["orchestrator", "researcher", "engineer"]`` (all described). Frozen here so
+#: any drift in the unset-key path fails loudly instead of silently re-formatting
+#: the prompt.
+_LEGACY_ROSTER_TEXT = (
+    "  - orchestrator: desc for orchestrator\n"
+    "  - researcher: desc for researcher\n"
+    "  - engineer: desc for engineer"
+)
+
+#: Full legacy user prompt for the same roster — the byte-identity oracle for a
+#: config with no ``fleet_profiles`` key.
+_LEGACY_PROMPT_TEXT = (
+    "Task id: t_frozen\n"
+    "Title: title\n"
+    "Body:\n"
+    "body\n"
+    "\n"
+    "Available profiles (assignees you may pick from):\n"
+    f"{_LEGACY_ROSTER_TEXT}\n"
+    "\n"
+    "Default assignee (used when no profile fits a task): orchestrator\n"
+)
+
+
+def _patch_env(names: list[str], cfg: dict):
+    """Registry + config patches for one routing scenario (context manager)."""
+    import contextlib
+
+    stack = contextlib.ExitStack()
+    for p in _patch_list_profiles(names):
+        stack.enter_context(p)
+    stack.enter_context(
+        patch("hermes_cli.config.load_config_readonly", return_value=cfg))
+    return stack
+
+
+def _prompt_roster_names(prompt: str) -> list[str]:
+    """Profile names as rendered in the prompt's 'Available profiles' block."""
+    names: list[str] = []
+    in_roster = False
+    for line in prompt.splitlines():
+        if line.startswith("Available profiles"):
+            in_roster = True
+            continue
+        if not in_roster:
+            continue
+        if line.startswith("  - "):
+            names.append(line[len("  - "):].split(":", 1)[0].strip())
+        elif not line.strip():
+            in_roster = False
+    return names
+
+
+def _warnings(caplog) -> list[str]:
+    return [r.getMessage() for r in caplog.records if r.levelno >= 30]
+
+
+def test_fleet_profiles_allowlist_restricts_roster_and_prompt(kanban_home):
+    """(a) key set -> roster filtered; the prompt offers ONLY allowlisted names."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="route by allowlist", triage=True)
+    payload = jsonlib.dumps({
+        "fanout": True,
+        "rationale": "one child",
+        "tasks": [{"title": "research it", "body": "go", "assignee": "researcher", "parents": []}],
+    })
+    cfg = {"kanban": {"fleet_profiles": ["orchestrator", "researcher"],
+                      "default_assignee": "orchestrator"}}
+
+    with _patch_env(["orchestrator", "researcher", "engineer", "ebrd"], cfg), \
+            _patch_aux_client(payload) as llm:
+        outcome = decomp.decompose_task(tid, author="me")
+
+    assert outcome.ok, outcome.reason
+    prompt = llm.call_args.kwargs["messages"][1]["content"]
+    assert _prompt_roster_names(prompt) == ["orchestrator", "researcher"]
+    # Naming a non-allowlisted profile anywhere in the prompt fails this leg.
+    assert "engineer" not in prompt
+    assert "ebrd" not in prompt
+
+    with kbc.connect() as conn:
+        child = kb.get_task(conn, outcome.child_ids[0])
+    assert child.assignee == "researcher"
+
+
+def test_fleet_profiles_unknown_entry_is_warned_and_skipped(kanban_home, caplog):
+    """(b) an entry naming no installed profile warns and is dropped."""
+    with kbc.connect() as conn:
+        kb.create_task(conn, title="triage work")
+    cfg = {"kanban": {"fleet_profiles": ["orchestrator", "ghost", "  "]}}
+
+    with _patch_env(["orchestrator", "researcher"], cfg):
+        with caplog.at_level(10, logger="hermes_cli.kanban_decompose"):
+            routing = decomp._load_routing()
+
+    assert [e["name"] for e in routing.roster] == ["orchestrator"]
+    assert routing.valid_names == {"orchestrator"}
+    warns = _warnings(caplog)
+    assert any("'ghost' names no installed profile" in w for w in warns), warns
+    assert any("'  ' is not a profile name" in w for w in warns), warns
+
+
+def test_fleet_profiles_unset_keeps_legacy_roster_bytes(kanban_home, caplog):
+    """(c) key unset -> roster, valid set and prompt bytes are the legacy ones."""
+    with kbc.connect() as conn:
+        kb.create_task(conn, title="triage work")
+    names = ["orchestrator", "researcher", "engineer"]
+
+    with _patch_env(names, {}):
+        with caplog.at_level(10, logger="hermes_cli.kanban_decompose"):
+            routing = decomp._load_routing()
+
+    assert [e["name"] for e in routing.roster] == names
+    assert routing.valid_names == set(names)
+    assert decomp._format_roster(routing.roster) == _LEGACY_ROSTER_TEXT
+    rendered = decomp._USER_TEMPLATE.format(
+        task_id="t_frozen", title="title", body="body",
+        roster=decomp._format_roster(routing.roster),
+        default_assignee=routing.default_assignee,
+    )
+    assert rendered == _LEGACY_PROMPT_TEXT
+    assert not [w for w in _warnings(caplog) if "fleet_profiles" in w]
+
+
+def test_fleet_profiles_rewrites_existing_but_non_roster_pick(kanban_home, caplog):
+    """(d) an installed profile outside the allowlist is rewritten to the default.
+
+    Closes the ebrd incident path (run 1051): the LLM picked an installed but
+    non-allowlisted profile and the mechanical backstop, keyed on the FILTERED
+    valid set, now catches it.
+    """
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="route me", triage=True)
+    payload = jsonlib.dumps({
+        "fanout": True,
+        "rationale": "two children",
+        "tasks": [
+            {"title": "one", "body": "b", "assignee": "ebrd", "parents": []},
+            {"title": "two", "body": "b", "assignee": "ebrd", "parents": []},
+        ],
+    })
+    cfg = {"kanban": {"fleet_profiles": ["orchestrator", "engineer"],
+                      "default_assignee": "engineer"}}
+
+    with _patch_env(["orchestrator", "engineer", "ebrd"], cfg):
+        with caplog.at_level(10, logger="hermes_cli.kanban_decompose"), \
+                _patch_aux_client(payload) as llm:
+            outcome = decomp.decompose_task(tid, author="me")
+
+    assert outcome.ok, outcome.reason
+    prompt = llm.call_args.kwargs["messages"][1]["content"]
+    assert _prompt_roster_names(prompt) == ["orchestrator", "engineer"]
+    assert "ebrd" not in prompt
+
+    with kbc.connect() as conn:
+        root = kb.get_task(conn, tid)
+        children = [kb.get_task(conn, cid) for cid in outcome.child_ids]
+    assert [c.assignee for c in children] == ["engineer", "engineer"]
+    assert root.assignee == "orchestrator"
+    assert any("picked unknown assignee 'ebrd'" in r.getMessage()
+               for r in caplog.records if r.levelno == 20)
+
+
+@pytest.mark.parametrize("value", [[], ["ghost"], None])
+def test_fleet_profiles_empty_after_validation_falls_back_with_warning(kanban_home, caplog, value):
+    """(e) set-but-unusable -> full registry, loudly warned (never strands)."""
+    with kbc.connect() as conn:
+        kb.create_task(conn, title="triage work")
+    names = ["orchestrator", "researcher", "engineer"]
+    cfg = {"kanban": {"fleet_profiles": value}}
+
+    with _patch_env(names, cfg):
+        with caplog.at_level(10, logger="hermes_cli.kanban_decompose"):
+            routing = decomp._load_routing()
+
+    assert [e["name"] for e in routing.roster] == names
+    assert routing.valid_names == set(names)
+    warns = _warnings(caplog)
+    assert any("yields no usable profile" in w and "NOT restricted" in w for w in warns), warns
+
+
+def test_fleet_profiles_wrong_type_falls_back_with_warning(kanban_home, caplog):
+    """A scalar (the common YAML typo) is rejected loudly, not silently honoured."""
+    with kbc.connect() as conn:
+        kb.create_task(conn, title="triage work")
+    names = ["orchestrator", "researcher"]
+    cfg = {"kanban": {"fleet_profiles": "orchestrator"}}
+
+    with _patch_env(names, cfg):
+        with caplog.at_level(10, logger="hermes_cli.kanban_decompose"):
+            routing = decomp._load_routing()
+
+    assert [e["name"] for e in routing.roster] == names
+    assert routing.valid_names == set(names)
+    assert any("must be a list of profile names" in w and "NOT restricted" in w
+               for w in _warnings(caplog))
+

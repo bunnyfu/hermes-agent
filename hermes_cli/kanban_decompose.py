@@ -153,23 +153,76 @@ def _resolve_profile_from_cfg(cfg: dict, key: str, *, fallback: Optional[str] = 
         return "default"
 
 
-def _build_roster() -> tuple[list[dict], set[str]]:
+def _resolve_fleet_allowlist(kanban_cfg: dict, known: set[str]) -> Optional[list[str]]:
+    """``kanban.fleet_profiles`` validated against the installed registry.
+
+    Returns ``None`` when the key is absent (legacy: the whole registry) and
+    ``None`` as well when the key is set but yields no usable entry — after a
+    loud warning, because decompose must never strand triage work over a config
+    typo. Entries that are not strings, are blank, or name no installed profile
+    are warned about and skipped; otherwise the surviving names, in config
+    order, are returned.
+    """
+    if not isinstance(kanban_cfg, dict) or "fleet_profiles" not in kanban_cfg:
+        return None
+    raw = kanban_cfg.get("fleet_profiles")
+    if raw is not None and not isinstance(raw, (list, tuple)):
+        logger.warning(
+            "decompose: kanban.fleet_profiles must be a list of profile names, got %s — "
+            "ignoring it and using the FULL profile registry; routing is NOT restricted",
+            type(raw).__name__,
+        )
+        return None
+    entries = list(raw or [])
+    wanted: list[str] = []
+    for entry in entries:
+        name = entry.strip() if isinstance(entry, str) else ""
+        if not name:
+            logger.warning(
+                "decompose: kanban.fleet_profiles entry %r is not a profile name — skipped", entry)
+            continue
+        if name not in known:
+            logger.warning(
+                "decompose: kanban.fleet_profiles entry %r names no installed profile — skipped", name)
+            continue
+        if name not in wanted:
+            wanted.append(name)
+    if not wanted:
+        logger.warning(
+            "decompose: kanban.fleet_profiles is set but yields no usable profile "
+            "(%d entr%s) — falling back to the FULL profile registry; "
+            "decompose routing is NOT restricted",
+            len(entries), "y" if len(entries) == 1 else "ies",
+        )
+        return None
+    return wanted
+
+
+def _build_roster(kanban_cfg: Optional[dict] = None) -> tuple[list[dict], set[str]]:
     """``(roster_for_prompt, valid_assignee_names)``; entries are
-    ``{name, description, has_description}``."""
+    ``{name, description, has_description}``.
+
+    ``kanban.fleet_profiles`` — when set and usable — narrows BOTH the prompt
+    roster and the valid-assignee set to the allowlisted profiles. Unset (or
+    unusable) keeps the legacy whole-registry behaviour untouched.
+    """
     try:
         all_profiles = profiles_mod.list_profiles()
     except Exception as exc:
         logger.warning("decompose: failed to list profiles: %s", exc)
         return [], set()
+    known = {p.name for p in all_profiles}
+    allowlist = _resolve_fleet_allowlist(kanban_cfg or {}, known)
+    selected = all_profiles if allowlist is None else [p for p in all_profiles if p.name in allowlist]
     roster = []
-    for p in all_profiles:
+    for p in selected:
         desc = (p.description or "").strip()
         roster.append({
             "name": p.name,
             "description": desc or f"(no description; profile named {p.name!r})",
             "has_description": bool(desc),
         })
-    return roster, {p.name for p in all_profiles}
+    return roster, {p.name for p in selected}
 
 
 def _format_roster(roster: list[dict]) -> str:
@@ -202,13 +255,20 @@ class _Routing:
 
 
 def _load_routing(*, root_assignee: Optional[str] = None) -> _Routing:
+    """Config-derived routing context for one decomposition.
+
+    ``kanban.fleet_profiles`` (list of profile names) narrows the roster the LLM
+    may pick from — and the set a pick is validated against — to that allowlist.
+    """
     from hermes_cli.config import load_config_readonly
     try:
         cfg = load_config_readonly()
     except Exception:  # decompose_task promises ok=False, never a raise, on config trouble
         cfg = {}
     kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
-    roster, valid_names = _build_roster()
+    if not isinstance(kanban_cfg, dict):
+        kanban_cfg = {}
+    roster, valid_names = _build_roster(kanban_cfg)
     return _Routing(
         orchestrator=_resolve_profile_from_cfg(cfg, "orchestrator_profile", fallback=root_assignee),
         default_assignee=_resolve_profile_from_cfg(cfg, "default_assignee", fallback=root_assignee),
