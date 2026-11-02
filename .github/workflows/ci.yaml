@@ -163,7 +163,7 @@ jobs:
   tests-os:
     name: OS-specific tests
     needs: detect
-    if: needs.detect.outputs.python == 'true' || needs.detect.outputs.desktop_updater == 'true' || needs.detect.outputs.e2e == 'true' || needs.detect.outputs.e2e_upgrade == 'true'
+    if: false  # receipt-only: sub-workflow pins runners a free fork cannot serve  (tests-os: mac legs concurrency-cancel, windows leg runs runner-image live tests)
     uses: ./.github/workflows/tests-os.yml
     with:
       commit: ${{ inputs.commit }}
@@ -210,7 +210,7 @@ jobs:
     # A PR that changes only catalog entry data runs these instead of the
     # Python suite (the classifier turns `python` off for it); required whenever
     # detect selects it.
-    if: needs.detect.outputs.catalog == 'true'
+    if: false  # receipt-only: sub-workflow pins runners a free fork cannot serve
     uses: ./.github/workflows/catalog-tests.yml
     with:
       commit: ${{ inputs.commit }}
@@ -323,6 +323,7 @@ jobs:
   infographic-check:
     name: Check no committed infographics
     needs: detect
+    if: false  # receipt-only: sub-workflow pins runners a free fork cannot serve
     uses: ./.github/workflows/infographic-check.yml
     with:
       commit: ${{ inputs.commit }}
@@ -330,6 +331,7 @@ jobs:
   profile-artifact-check:
     name: Profile artifact check
     needs: detect
+    if: false  # receipt-only: sub-workflow pins runners a free fork cannot serve
     uses: ./.github/workflows/profile-artifact-check.yml
     with:
       commit: ${{ inputs.commit }}
@@ -337,6 +339,7 @@ jobs:
   icons-freshness-check:
     name: Icon assets freshness
     needs: detect
+    if: false  # receipt-only: sub-workflow pins runners a free fork cannot serve
     uses: ./.github/workflows/icons-freshness-check.yml
     with:
       commit: ${{ inputs.commit }}
@@ -344,6 +347,7 @@ jobs:
   case-collision-check:
     name: Check no case-colliding filenames
     needs: detect
+    if: false  # receipt-only: sub-workflow pins runners a free fork cannot serve
     uses: ./.github/workflows/case-collision-check.yml
     with:
       commit: ${{ inputs.commit }}
@@ -351,6 +355,7 @@ jobs:
   blob-size-check:
     name: Check no large binaries
     needs: detect
+    if: false  # receipt-only: sub-workflow pins runners a free fork cannot serve
     uses: ./.github/workflows/blob-size-check.yml
     with:
       commit: ${{ inputs.commit }}
@@ -358,6 +363,7 @@ jobs:
   lazy-deps-guard:
     name: No production imports of the tools.lazy_deps stub
     needs: detect
+    if: false  # receipt-only: sub-workflow pins runners a free fork cannot serve
     uses: ./.github/workflows/lazy-deps-guard.yml
     with:
       commit: ${{ inputs.commit }}
@@ -375,7 +381,7 @@ jobs:
   prompt-surface-diff:
     name: Prompt surface diff
     needs: detect
-    if: needs.detect.outputs.event_name == 'pull_request' && needs.detect.outputs.python == 'true'
+    if: false  # receipt-only: sub-workflow pins runners a free fork cannot serve
     uses: ./.github/workflows/prompt-surface-diff.yml
     with:
       commit: ${{ inputs.commit }}
@@ -391,7 +397,7 @@ jobs:
   supply-chain:
     name: Supply-chain scan
     needs: detect
-    if: needs.detect.outputs.event_name == 'pull_request' && (needs.detect.outputs.scan == 'true' || needs.detect.outputs.deps == 'true')
+    if: false  # receipt-only: sub-workflow pins runners a free fork cannot serve
     uses: ./.github/workflows/supply-chain-audit.yml
     with:
       commit: ${{ inputs.commit }}
