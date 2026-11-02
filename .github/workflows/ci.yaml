@@ -70,8 +70,8 @@ jobs:
   # ─────────────────────────────────────────────────────────────────────
   detect:
     name: Detect affected areas
-    runs-on: blacksmith-4vcpu-ubuntu-2404
-    timeout-minutes: 3
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
     outputs:
       python: ${{ steps.gate-lanes.outputs.python }}
       python_prod: ${{ steps.gate-lanes.outputs.python_prod }}
@@ -462,8 +462,8 @@ jobs:
       # to block a merge. A separate run also stops it from holding this
       # run open. That is what blocked ``gh run rerun``.
     if: always()
-    runs-on: blacksmith-4vcpu-ubuntu-2404
-    timeout-minutes: 10
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
     outputs:
       needs-json: ${{ steps.evaluate.outputs.needs-json }}
     steps:
@@ -500,8 +500,8 @@ jobs:
       actions: read # download completed jobs' cache transfer logs
     needs: [all-checks-pass]
     if: always()
-    runs-on: blacksmith-4vcpu-ubuntu-2404
-    timeout-minutes: 10
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - name: Checkout code
         uses: useblacksmith/checkout@25227e61ff9dafe400e22fa487b673eac4e4409a  # v1
