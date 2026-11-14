@@ -287,6 +287,12 @@ def _run_worker_turns(agent, frame, history):
         return result
     except Exception as exc:
         code = turn_exit_code(None, kanban_worker=True, **credential_failure_flags(exc))
+        # Book the cause, not silence: the finally below records it, so the board's
+        # worker_result and the submitter's crash diagnostics quote why the turn died.
+        # Head-truncated (the type and message lead carry the signal), redaction-bounded
+        # like every string that leaves the process.
+        from agent.monitoring.redaction import redact_bounded
+        last_output = redact_bounded(f'{type(exc).__name__}: {exc}')
         raise
     finally:
         _record_worker_result(context, code, last_output)
@@ -386,10 +392,13 @@ KANBAN_TURN_AUTHOR = {'id': 'kanban:dispatcher', 'name': 'Kanban dispatcher', 'i
 
 
 def _run_task_turns(agent, frame, history, context):
-    from agent.skill_commands import build_preloaded_skills_prompt
+    from agent.skill_commands import build_preloaded_skills_prompt, format_missing_skills
     skills, loaded, missing = build_preloaded_skills_prompt(context['skills'], task_id=agent.session_id)
     if missing and not loaded:
-        raise ValueError('kanban_skills_unavailable')
+        # A deterministic per-card config error, not a fabric fault: name the skills the assignee
+        # profile lacks (the same wording every other preload surface uses) so the board's
+        # worker_result says WHICH pin died instead of quoting a bare sentinel.
+        raise ValueError(f'kanban_skills_unavailable: {format_missing_skills(missing)}')
     prompt = '\n\n'.join(p for p in (skills, context['context'], frame['text']) if p)
     result = agent.run_conversation(prompt, conversation_history=history, turn_author=KANBAN_TURN_AUTHOR)
 

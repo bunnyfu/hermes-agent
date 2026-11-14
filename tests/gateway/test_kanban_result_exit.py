@@ -119,3 +119,60 @@ def test_managed_result_redacts_secrets_straddling_the_tail_cut(tmp_path, monkey
     output = session_kanban.worker_result(path, context)["last_output"]
     assert len(output) <= 500
     assert leaked not in output
+
+
+def test_managed_skill_preload_death_names_the_missing_skill(tmp_path, monkeypatch):
+    """A card pinning a skill the assignee profile lacks is a deterministic per-card config
+    error: the raise and the board's worker_result must name the skill, not book a bare
+    sentinel with an empty last_output (the death that read as a fabric fault for a day)."""
+    path, context = _bound_claim(tmp_path, monkeypatch)
+    monkeypatch.setattr("agent.skill_commands.build_preloaded_skills_prompt",
+                        lambda identifiers, **_kw: ("", [], list(identifiers)))
+    context = dict(context, skills=["no-such-skill"])
+    frame = {"policy": {"kanban_json": json.dumps(context)}, "text": "work"}
+
+    with pytest.raises(ValueError) as raised:
+        session_kanban.run_worker_turns(SimpleNamespace(session_id="probe"), frame, [])
+    assert "kanban_skills_unavailable" in str(raised.value)
+    assert "no-such-skill" in str(raised.value)
+
+    result = session_kanban.worker_result(path, context)
+    assert result["exit_code"] == 1
+    assert "kanban_skills_unavailable" in result["last_output"]
+    assert "no-such-skill" in result["last_output"]
+
+
+def test_managed_crash_books_exception_text_as_last_output(tmp_path, monkeypatch):
+    """Any turn exception reaches the board's worker_result quoted (type + message), so the
+    breaker and the submitter's crash diagnostics carry the real cause, not an empty string."""
+    path, context = _bound_claim(tmp_path, monkeypatch)
+
+    def boom(*_args):
+        raise RuntimeError("provider exploded: HTTP 599")
+
+    monkeypatch.setattr(session_kanban, "_run_task_turns", boom)
+    frame = {"policy": {"kanban_json": json.dumps(context)}}
+
+    with pytest.raises(RuntimeError, match="provider exploded"):
+        session_kanban.run_worker_turns(SimpleNamespace(), frame, [])
+    result = session_kanban.worker_result(path, context)
+    assert result["exit_code"] == 1
+    assert result["last_output"] == "RuntimeError: provider exploded: HTTP 599"
+
+
+def test_managed_crash_last_output_is_redacted_and_bounded(tmp_path, monkeypatch):
+    """The booked cause leaves the process like every other exported string: PII-redacted and
+    inside the existing 500-char last_output budget, head kept (the type and message lead)."""
+    path, context = _bound_claim(tmp_path, monkeypatch)
+
+    def flood(*_args):
+        raise ValueError("user@example.com failed: " + "x" * 2000)
+
+    monkeypatch.setattr(session_kanban, "_run_task_turns", flood)
+    frame = {"policy": {"kanban_json": json.dumps(context)}}
+
+    with pytest.raises(ValueError):
+        session_kanban.run_worker_turns(SimpleNamespace(), frame, [])
+    last_output = session_kanban.worker_result(path, context)["last_output"]
+    assert len(last_output) <= 500
+    assert last_output.startswith("ValueError: [email] failed: ")
