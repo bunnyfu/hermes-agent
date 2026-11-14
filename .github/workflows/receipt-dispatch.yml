@@ -1,14 +1,21 @@
 name: receipt-dispatch
 
-# Receipt-lane shim (fork-only): the fork's CI workflow is disabled, and the
-# lane's token cannot re-enable it (no workflow scope). A NEW workflow file is
-# enabled by default, so this shim provides a dispatchable entry point that
-# calls the real ci.yaml orchestrator via workflow_call. It rides the receipt
-# PR's base commit, so it never appears in the reviewed payload diff.
+# Receipt-lane shim (fork-only). The fork's workflows are disabled and the
+# lane's token has no `workflow` scope to re-enable them; a NEW workflow file
+# path is enabled by default, so this shim is the dispatchable entry point.
+# It calls tests-receipt.yml — a copy of tests.yml (the original stays in the
+# checkout so the CI meta-tests keep finding it) — for the Python suite, the
+# lane that carries the signal for a Python/locale payload. E2E lanes are off:
+# environment-bound on free runners and untouched by this payload.
+# All of this rides the receipt PR's base commit and never appears in the
+# reviewed payload diff.
 
 on:
   workflow_dispatch:
 
 jobs:
-  call-ci:
-    uses: ./.github/workflows/ci.yaml
+  python-suite:
+    uses: ./.github/workflows/tests-receipt.yml
+    with:
+      e2e: false
+      e2e_upgrade: false
