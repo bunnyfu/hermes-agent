@@ -43,7 +43,7 @@ jobs:
     name: Python lints
     # A frontend-only push has nothing to check here (the ratchet is PR-only).
     if: inputs.python || inputs.event_name == 'pull_request'
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - name: Checkout code

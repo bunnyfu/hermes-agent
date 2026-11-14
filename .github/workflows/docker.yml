@@ -83,7 +83,7 @@ jobs:
   # never weakened.
   mode:
     name: Resolve release phase and affected areas
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
       phase: ${{ steps.resolve.outputs.phase }}
@@ -158,12 +158,12 @@ jobs:
         variant: [slim, desktop]
         include:
           - arch: amd64
-            runner: blacksmith-32vcpu-ubuntu-2404
+            runner: ubuntu-latest
             platform: linux/amd64
           # arm64 builds on the native arm64 larger runner. A build of
           # linux/arm64 on an x64 host uses emulation.
           - arch: arm64
-            runner: blacksmith-32vcpu-ubuntu-2404-arm
+            runner: ubuntu-24.04-arm
             platform: linux/arm64
 
     runs-on: ${{ matrix.runner }}
@@ -349,11 +349,11 @@ jobs:
         variant: [slim, desktop]
         include:
           - arch: amd64
-            runner: blacksmith-32vcpu-ubuntu-2404
+            runner: ubuntu-latest
             platform: linux/amd64
           # Native arm64 for the same reason as the build matrix above.
           - arch: arm64
-            runner: blacksmith-32vcpu-ubuntu-2404-arm
+            runner: ubuntu-24.04-arm
             platform: linux/arm64
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
@@ -541,7 +541,7 @@ jobs:
       matrix:
         arch: [amd64, arm64]
         variant: [slim, desktop]
-    runs-on: blacksmith-32vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
       ARCH: ${{ matrix.arch }}
@@ -767,7 +767,7 @@ jobs:
     name: Docker phase requirements met
     if: always() && inputs.release-phase != ''
     needs: [mode, build, release-publish, release-publish-manifest]
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - name: Validate phase job results
